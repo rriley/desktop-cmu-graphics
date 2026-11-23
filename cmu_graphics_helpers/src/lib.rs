@@ -261,6 +261,9 @@ const MASK_CACHE_MAX_SEEN: usize = 1024;
 
 struct CachedMask {
     matrix: [u32; 9],
+    // What else the mask depends on: [0, 0, 0] for a fill, and see
+    // border_with_mask for a border
+    extra: [u32; 3],
     fill_type: skia_safe::PathFillType,
     verbs: Vec<skia_safe::PathVerb>,
     points: Vec<(u32, u32)>,
@@ -275,6 +278,7 @@ struct CachedMask {
 impl CachedMask {
     fn matches(&self, key: &MaskKey<'_>) -> bool {
         self.matrix == key.matrix
+            && self.extra == key.extra
             && self.fill_type == key.path.fill_type()
             && self.verbs.as_slice() == key.path.verbs()
             && self.points.len() == key.path.points().len()
@@ -295,11 +299,12 @@ impl CachedMask {
 struct MaskKey<'a> {
     path: &'a Path,
     matrix: [u32; 9],
+    extra: [u32; 3],
     hash: u64,
 }
 
 impl<'a> MaskKey<'a> {
-    fn new(path: &'a Path, matrix: &Matrix) -> Self {
+    fn new(path: &'a Path, matrix: &Matrix, extra: [u32; 3]) -> Self {
         let mut matrix_bits = [0u32; 9];
         for (i, bits) in matrix_bits.iter_mut().enumerate() {
             *bits = matrix[i].to_bits();
@@ -311,6 +316,7 @@ impl<'a> MaskKey<'a> {
             hash = (hash ^ u64::from(word)).wrapping_mul(0x0000_0100_0000_01b3);
         };
         matrix_bits.iter().for_each(|bits| add(*bits));
+        extra.iter().for_each(|word| add(*word));
         add(path.fill_type() as u32);
         path.verbs().iter().for_each(|verb| add(*verb as u32));
         path.points().iter().for_each(|p| {
@@ -321,6 +327,7 @@ impl<'a> MaskKey<'a> {
         MaskKey {
             path,
             matrix: matrix_bits,
+            extra,
             hash,
         }
     }
@@ -375,28 +382,99 @@ fn paint_allows_mask(paint: &Paint) -> bool {
 }
 
 // Fills path with paint, using a cached coverage mask when possible.
-fn fill_path(surface: &mut skia_safe::Surface, cache: &mut FillCache, path: &Path, paint: &Paint) {
-    if !fill_path_with_mask(surface, cache, path, paint) {
-        surface.canvas().draw_path(path, paint);
+fn fill_path(
+    canvas: &skia_safe::Canvas,
+    bounds: skia_safe::IRect,
+    cache: &mut FillCache,
+    path: &Path,
+    paint: &Paint,
+) {
+    if !fill_path_with_mask(canvas, bounds, cache, path, paint) {
+        canvas.draw_path(path, paint);
     }
 }
 
 // Returns false if the path wasn't drawn, and should be filled normally.
 fn fill_path_with_mask(
-    surface: &mut skia_safe::Surface,
+    canvas: &skia_safe::Canvas,
+    surface_bounds: skia_safe::IRect,
     cache: &mut FillCache,
     path: &Path,
     paint: &Paint,
 ) -> bool {
-    if path.count_points() < MASK_CACHE_MIN_POINTS
-        || path.is_inverse_fill_type()
+    if path.count_points() < MASK_CACHE_MIN_POINTS {
+        return false;
+    }
+    let anti_alias = paint.is_anti_alias();
+    draw_with_mask(
+        canvas,
+        surface_bounds,
+        cache,
+        path,
+        paint,
+        [0, 0, 0],
+        &|mask_canvas: &skia_safe::Canvas, device_path: &Path, _matrix: &Matrix| {
+            let mut mask_paint = Paint::default();
+            mask_paint.set_anti_alias(anti_alias);
+            mask_canvas.draw_path(device_path, &mask_paint);
+        },
+    )
+}
+
+// Draws a closed path's border the way draw_closed_shape does (clipped to
+// the path, with twice the border's width), using a cached coverage mask
+// when possible. Compositing the mask isn't always exactly the same as
+// stroking under the clip (the clip's and the stroke's coverage are
+// multiplied and rounded once, instead of as they're drawn), so it's only
+// used when approximate drawing is on. Returns false if nothing was drawn.
+#[allow(clippy::too_many_arguments)]
+fn border_with_mask(
+    canvas: &skia_safe::Canvas,
+    surface_bounds: skia_safe::IRect,
+    cache: &mut FillCache,
+    path: &Path,
+    paint: &Paint,
+    stroke_paint: &Paint,
+    border_width: f32,
+    dashed: bool,
+) -> bool {
+    draw_with_mask(
+        canvas,
+        surface_bounds,
+        cache,
+        path,
+        paint,
+        [1, border_width.to_bits(), u32::from(dashed)],
+        &|mask_canvas: &skia_safe::Canvas, _device_path: &Path, matrix: &Matrix| {
+            let mut mask_stroke = stroke_paint.clone();
+            mask_stroke.set_color(Color::BLACK);
+            mask_canvas.set_matrix(&skia_safe::M44::from(matrix));
+            mask_canvas.clip_path(path, None, true);
+            mask_canvas.draw_path(path, &mask_stroke);
+        },
+    )
+}
+
+// Draws coverage that render draws into an alpha mask (with the device
+// path, moved to the mask's origin, and the matrix from the path to the
+// mask), colored by paint, using a cached mask when possible. extra is what
+// else (besides the path and the matrix) the mask depends on. Returns false
+// if nothing was drawn.
+fn draw_with_mask(
+    canvas: &skia_safe::Canvas,
+    surface_bounds: skia_safe::IRect,
+    cache: &mut FillCache,
+    path: &Path,
+    paint: &Paint,
+    extra: [u32; 3],
+    render: &dyn Fn(&skia_safe::Canvas, &Path, &Matrix),
+) -> bool {
+    if path.is_inverse_fill_type()
         || !path.is_finite()
         || !paint_allows_mask(paint)
     {
         return false;
     }
-    let surface_bounds = skia_safe::IRect::from_wh(surface.width(), surface.height());
-    let canvas = surface.canvas();
     // Masks are made without a clip, so only use them when nothing is clipped
     if !canvas.is_clip_rect() || canvas.device_clip_bounds() != Some(surface_bounds) {
         return false;
@@ -406,7 +484,7 @@ fn fill_path_with_mask(
         return false;
     }
 
-    let key = MaskKey::new(path, &matrix);
+    let key = MaskKey::new(path, &matrix, extra);
     cache.clock += 1;
     let clock = cache.clock;
     // An entry that doesn't match is a different path with the same hash,
@@ -444,11 +522,13 @@ fn fill_path_with_mask(
     else {
         return false;
     };
-    let mut mask_paint = Paint::default();
-    mask_paint.set_anti_alias(paint.is_anti_alias());
-    mask_surface.canvas().draw_path(
-        &device_path.with_offset((-bounds.left() as f32, -bounds.top() as f32)),
-        &mask_paint,
+    let offset = (-bounds.left() as f32, -bounds.top() as f32);
+    let mut mask_matrix = Matrix::translate(offset);
+    mask_matrix.pre_concat(&matrix);
+    render(
+        mask_surface.canvas(),
+        &device_path.with_offset(offset),
+        &mask_matrix,
     );
     let mask = mask_surface.image_snapshot();
     let bytes = (bounds.width() as usize) * (bounds.height() as usize);
@@ -462,6 +542,7 @@ fn fill_path_with_mask(
         key.hash,
         CachedMask {
             matrix: key.matrix,
+            extra: key.extra,
             fill_type: path.fill_type(),
             verbs: path.verbs().to_vec(),
             points: path
@@ -477,7 +558,7 @@ fn fill_path_with_mask(
             last_used: clock,
         },
     );
-    draw_mask(surface.canvas(), &mask, bounds.left(), bounds.top(), paint)
+    draw_mask(canvas, &mask, bounds.left(), bounds.top(), paint)
 }
 
 // Composites an alpha mask in device space, colored by paint. Rather than
@@ -907,8 +988,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        self.skia_surface
-            .canvas()
+        self.skia_surface.canvas()
             .draw_str(&text, point, font, &paint);
         Ok(())
     }
@@ -981,7 +1061,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        fill_path(&mut self.skia_surface, &mut self.fill_cache, &path, &paint);
+        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &path, &paint); }
         Ok(())
     }
 
@@ -994,7 +1074,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        fill_path(&mut self.skia_surface, &mut self.fill_cache, &path, &paint);
+        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &path, &paint); }
         Ok(())
     }
 
@@ -1091,7 +1171,11 @@ impl Canvas {
     // kind 1 is an oval: coords are its bezier points' x and y, and the path
     // is move_to(the first point), curve_to for each next 3 points (while
     // there are 4 left to start from), then close_path().
-    #[pyo3(signature = (kind, coords, fill, border, border_width, dashed))]
+    //
+    // With approx, the border is drawn from a cached coverage mask when
+    // possible (see border_with_mask), which isn't exactly the same.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (kind, coords, fill, border, border_width, dashed, approx = false))]
     fn draw_closed_shape(
         &mut self,
         kind: u8,
@@ -1100,27 +1184,36 @@ impl Canvas {
         border: Option<(f32, f32, f32, f32)>,
         border_width: f32,
         dashed: bool,
+        approx: bool,
     ) -> PyResult<()> {
-        let n = coords.len() / 2;
-        if n == 0 || coords.len() % 2 != 0 {
+        if coords.is_empty() || !coords.len().is_multiple_of(2) {
             return Err(PyRuntimeError::new_err(
                 "draw_closed_shape needs an x and y for each point",
             ));
         }
-        let point = |i: usize| Point::new(coords[2 * i], coords[2 * i + 1]);
+        let points: Vec<Point> = coords
+            .chunks_exact(2)
+            .map(|xy| match xy {
+                [x, y] => Point::new(*x, *y),
+                _ => Point::default(),
+            })
+            .collect();
         let mut pb = PathBuilder::new();
-        match kind {
-            0 => {
-                pb.move_to(point(n - 1));
-                for i in 0..n {
-                    pb.line_to(point(i));
+        match (kind, points.split_first(), points.last()) {
+            (0, _, Some(last)) => {
+                pb.move_to(*last);
+                for point in &points {
+                    pb.line_to(*point);
                 }
             }
-            1 => {
-                pb.move_to(point(0));
-                for i in 0..n / 4 {
-                    let i2 = i * 4;
-                    pb.cubic_to(point(i2 + 1), point(i2 + 2), point(i2 + 3));
+            (1, Some((first, rest)), _) => {
+                pb.move_to(*first);
+                // The curves start at points 0, 4, 8, ..., one for each 4
+                // points (curve_to(points[i + 1], points[i + 2], points[i + 3]))
+                for curve in rest.chunks(4) {
+                    if let [p1, p2, p3, ..] = curve {
+                        pb.cubic_to(*p1, *p2, *p3);
+                    }
                 }
                 pb.close();
             }
@@ -1133,7 +1226,7 @@ impl Canvas {
             paint.set_color4f(Color4f::new(r, g, b, a), None);
             paint.set_stroke(false);
             paint.set_anti_alias(true);
-            fill_path(&mut self.skia_surface, &mut self.fill_cache, &pb.snapshot(), &paint);
+            { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
         }
         match border {
             Some((r, g, b, a)) => {
@@ -1145,11 +1238,30 @@ impl Canvas {
                 paint.set_stroke_width(border_width);
                 paint.set_stroke(true);
                 paint.set_anti_alias(true);
-                let canvas = self.skia_surface.canvas();
-                canvas.save();
-                canvas.clip_path(&pb.snapshot(), None, true);
-                canvas.draw_path(&pb.detach(), &paint);
-                canvas.restore();
+                let drawn = approx && {
+                    let mut color_paint = self.paint.clone();
+                    color_paint.set_shader(None);
+                    color_paint.set_color4f(Color4f::new(r, g, b, a), None);
+                    color_paint.set_anti_alias(true);
+                    let bounds = self.bounds();
+                    border_with_mask(
+                        self.skia_surface.canvas(),
+                        bounds,
+                        &mut self.fill_cache,
+                        &pb.snapshot(),
+                        &color_paint,
+                        &paint,
+                        border_width,
+                        dashed,
+                    )
+                };
+                if !drawn {
+                    let canvas = self.skia_surface.canvas();
+                    canvas.save();
+                    canvas.clip_path(&pb.snapshot(), None, true);
+                    canvas.draw_path(&pb.detach(), &paint);
+                    canvas.restore();
+                }
                 // stroke() uses up the path
                 self.path = None;
             }
@@ -1198,7 +1310,7 @@ impl Canvas {
         paint.set_color4f(Color4f::new(r, g, b, a), None);
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        fill_path(&mut self.skia_surface, &mut self.fill_cache, &pb.snapshot(), &paint);
+        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
         match border {
             Some((r, g, b, a)) => {
                 let mut paint = self.paint.clone();
@@ -1207,13 +1319,56 @@ impl Canvas {
                 paint.set_stroke_width(border_width);
                 paint.set_stroke(true);
                 paint.set_anti_alias(true);
-                self.skia_surface
-                    .canvas()
-                    .draw_path(&pb.detach(), &paint);
+                self.skia_surface.canvas().draw_path(&pb.detach(), &paint);
                 self.path = None;
             }
             None => self.path = Some(pb),
         }
+        Ok(())
+    }
+
+    // draw_text without a border, approximately: Skia draws the text from
+    // its glyph cache, instead of filling the text's outline (which Skia
+    // supersamples to antialias it, and which costs much more for text that
+    // isn't in the fill cache because it keeps changing). The glyphs are
+    // unhinted and positioned to a fraction of a pixel, like the outline,
+    // so only their antialiasing is a little different.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (text, x, y, family, weight, slant, size, fill))]
+    fn draw_text_approx(
+        &mut self,
+        text: String,
+        x: f32,
+        y: f32,
+        family: String,
+        weight: FontWeight,
+        slant: FontSlant,
+        size: f32,
+        fill: (f32, f32, f32, f32),
+    ) -> PyResult<()> {
+        let style = FontStyle::new(
+            py_to_skia_weight(weight),
+            font_style::Width::NORMAL,
+            py_to_skia_slant(slant),
+        );
+        let mut font = self.font.clone();
+        font.set_typeface(cached_typeface(&family, style)?);
+        font.set_size(size);
+        font.set_subpixel(true);
+        font.set_hinting(skia_safe::FontHinting::None);
+        font.set_edging(skia_safe::font::Edging::AntiAlias);
+        let point = Point::new(x, y);
+        let (r, g, b, a) = fill;
+        let mut paint = self.paint.clone();
+        paint.set_shader(None);
+        paint.set_color4f(Color4f::new(r, g, b, a), None);
+        paint.set_stroke(false);
+        paint.set_anti_alias(true);
+        self.skia_surface.canvas()
+            .draw_str(&text, point, &font, &paint);
+        let mut pb = PathBuilder::new();
+        pb.move_to(point);
+        self.path = Some(pb);
         Ok(())
     }
 
@@ -1258,6 +1413,12 @@ fn plain_numbers(values: &Bound<'_, pyo3::types::PyTuple>) -> bool {
         };
         (-1e9..=1e9).contains(&number)
     })
+}
+
+impl Canvas {
+    fn bounds(&mut self) -> skia_safe::IRect {
+        skia_safe::IRect::from_wh(self.skia_surface.width(), self.skia_surface.height())
+    }
 }
 
 fn create_image(data: skia_safe::Data) -> PyResult<WyvernImage> {

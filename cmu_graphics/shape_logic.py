@@ -4787,6 +4787,35 @@ def addPendingShape(plan, makeArgs):
     tlgShape.__dict__['_pending'].append((plan[1], plan[2], plan[0], shapeId, makeArgs))
 
 
+def _approxOptions(value):
+    """The approximate drawing optimizations that CMU_GRAPHICS_APPROX turns
+    on: speedups whose output is very close to, but not always exactly the
+    same as, the normal drawing. '1' or 'all' turns on all of them, or it can
+    name them, separated by commas. A name with a '-' in front turns that one
+    off, as in 'all,-text'."""
+    options = set()
+    for name in value.replace(' ', '').lower().split(','):
+        if name in ('1', 'all', 'on', 'true', 'yes'):
+            options |= APPROX_OPTIONS
+        elif name.startswith('-'):
+            options.discard(name[1:])
+        elif name in APPROX_OPTIONS:
+            options.add(name)
+    return frozenset(options)
+
+
+# The approximate drawing optimizations (see _approxOptions):
+#   text:    draw labels from Skia's glyph cache instead of filling their
+#            outlines (antialiased a little differently)
+#   borders: draw borders of shapes that are drawn the same way again and
+#            again from cached coverage masks (rounded a little differently)
+APPROX_OPTIONS = frozenset(('text', 'borders'))
+APPROX = _approxOptions(os.environ.get('CMU_GRAPHICS_APPROX', ''))
+# (Canvases from before approximate drawing don't have these)
+_APPROX_TEXT = 'text' in APPROX and hasattr(wyvern.Canvas, 'draw_text_approx')
+_APPROX_BORDERS = 'borders' in APPROX and hasattr(wyvern.Canvas, 'draw_text_approx')
+
+
 # Faster versions of LazyShape draw functions, by the draw function, for
 # drawing on a wyvern Canvas (see TopLevelGroup.draw). Filled in below.
 _FAST_DRAWERS = {}
@@ -4989,6 +5018,18 @@ def _fastDrawLazyFlatOval(ctx, coords, style):
     # _drawLazyFlatOval with one Canvas call
     fill, border, bw, dashed = style.resolved()[7]
     ctx.draw_closed_shape(1, coords, fill, border, bw, dashed)
+
+
+def _approxDrawLazyFlatPolygon(ctx, coords, style):
+    # _fastDrawLazyFlatPolygon, with approximate drawing's 'borders'
+    fill, border, bw, dashed = style.resolved()[7]
+    ctx.draw_closed_shape(0, coords, fill, border, bw, dashed, border is not None)
+
+
+def _approxDrawLazyFlatOval(ctx, coords, style):
+    # _fastDrawLazyFlatOval, with approximate drawing's 'borders'
+    fill, border, bw, dashed = style.resolved()[7]
+    ctx.draw_closed_shape(1, coords, fill, border, bw, dashed, border is not None)
 
 
 def _drawLazyLine(ctx, x1, y1, x2, y2, lineWidth, style):
@@ -5218,6 +5259,18 @@ def _fastDrawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, sty
         font = translatedDefault(shapeAttrDefaults, 'font')
     bw = borderWidth if border else 0
     family, weight, slant = getFont(font, bold, italic)
+    if not bw and _APPROX_TEXT:
+        ctx.draw_text_approx(
+            text,
+            target[0] - xAdjust,
+            target[1],
+            family,
+            weight,
+            slant,
+            size,
+            (0, 0, 0, 1) if fill is None else resolved[5],
+        )
+        return
     ctx.draw_text(
         text,
         target[0] - xAdjust,
@@ -5234,8 +5287,12 @@ def _fastDrawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, sty
 
 
 if hasattr(wyvern.Canvas, 'draw_closed_shape') and hasattr(wyvern.Canvas, 'draw_text'):
-    _FAST_DRAWERS[_drawLazyFlatPolygon] = _fastDrawLazyFlatPolygon
-    _FAST_DRAWERS[_drawLazyFlatOval] = _fastDrawLazyFlatOval
+    if _APPROX_BORDERS:
+        _FAST_DRAWERS[_drawLazyFlatPolygon] = _approxDrawLazyFlatPolygon
+        _FAST_DRAWERS[_drawLazyFlatOval] = _approxDrawLazyFlatOval
+    else:
+        _FAST_DRAWERS[_drawLazyFlatPolygon] = _fastDrawLazyFlatPolygon
+        _FAST_DRAWERS[_drawLazyFlatOval] = _fastDrawLazyFlatOval
 
 
 _LAZY_LABEL_VALUE_TYPES = frozenset((str, int, float, bool, type(None)))
