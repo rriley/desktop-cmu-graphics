@@ -1,5 +1,11 @@
 HASH_MODULUS = 1_000_000_007
 
+# The types deepHash hashes directly. Instances of exactly these types are
+# hashed inline in the loop below, instead of with a recursive call; anything
+# else (including subclasses, which isinstance would also accept) still goes
+# through deepHash, so the results are the same either way.
+_PRIMITIVE_TYPES = frozenset((type(None), bool, int, float, str))
+
 
 def deepHash(obj, seen):
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -28,7 +34,11 @@ def deepHash(obj, seen):
 
     result = 0
     for value in values:
-        result = (result * 31 + deepHash(value, seen)) % HASH_MODULUS
+        if type(value) in _PRIMITIVE_TYPES:
+            valueHash = hash(value) % HASH_MODULUS
+        else:
+            valueHash = deepHash(value, seen)
+        result = (result * 31 + valueHash) % HASH_MODULUS
     return result
 
 

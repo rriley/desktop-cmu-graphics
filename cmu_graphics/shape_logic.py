@@ -129,9 +129,39 @@ def reverseSearchLanguageDict(d, key):
     return key, None
 
 
+# t() and toEnglish() run many times per frame (every shape attribute read
+# translates its default value), but the translation tables never change once
+# built. Remember results per language, only for keys whose type is exactly
+# str: the uncached path returns the key object itself when it has no
+# translation, and other key types (str subclasses with their own __eq__,
+# unhashable values) must keep that identity and raise the same errors.
+_tCache = {}
+# Keys can come from student code (attribute names, colors), so a program
+# that makes up endless new strings could grow the caches forever. Start
+# over past this size instead.
+_MAX_TRANSLATION_CACHE_SIZE = 10000
+# Values that can never equal a translation table key (all keys are str)
+_UNTRANSLATABLE_TYPES = (type(None), bool, int, float)
+
+
 def t(key, variables=None, language=None):
     if language is None:
         language = cmuGraphicsLanguage
+
+    if variables is None:
+        keyType = type(key)
+        if keyType in _UNTRANSLATABLE_TYPES:
+            return key
+        if keyType is str:
+            cacheKey = (key, language)
+            res = _tCache.get(cacheKey, _tCache)
+            if res is _tCache:
+                if len(_tCache) >= _MAX_TRANSLATION_CACHE_SIZE:
+                    _tCache.clear()
+                res = _tCache[cacheKey] = getOrDefault(
+                    TRANSLATED_STRINGS.get(language), key
+                )
+            return res
 
     res = getOrDefault(TRANSLATED_STRINGS.get(language), key)
 
@@ -142,7 +172,23 @@ def t(key, variables=None, language=None):
     return res
 
 
+_toEnglishCache = {}
+
+
 def toEnglish(key, context, returnLanguage=False):
+    if type(key) is str:
+        cacheKey = (key, context, cmuGraphicsLanguage)
+        result = _toEnglishCache.get(cacheKey)
+        if result is None:
+            if len(_toEnglishCache) >= _MAX_TRANSLATION_CACHE_SIZE:
+                _toEnglishCache.clear()
+            result = _toEnglishCache[cacheKey] = _toEnglishUncached(key, context)
+        return result if returnLanguage else result[0]
+    result = _toEnglishUncached(key, context)
+    return result if returnLanguage else result[0]
+
+
+def _toEnglishUncached(key, context):
     if context == 'color':
         key = key.lower()
 
@@ -150,12 +196,7 @@ def toEnglish(key, context, returnLanguage=False):
     if searchDict is None:
         searchDict = REVERSE_TRANSLATED_STRINGS
 
-    translation, originalLanguage = reverseSearchLanguageDict(searchDict, key)
-
-    if returnLanguage:
-        return translation, originalLanguage
-    else:
-        return translation
+    return reverseSearchLanguageDict(searchDict, key)
 
 
 supportedLanguages = ['en', 'es', 'de']
@@ -264,7 +305,7 @@ def checkInt(obj, attr, value, isFn):
 
 
 def checkNumber(obj, attr, value, isFn):
-    if not isinstance(value, int) and not isinstance(value, float):
+    if not isinstance(value, (int, float)):
         typeError(obj, attr, value, t('number'), isFn)
 
 
@@ -424,6 +465,14 @@ def checkPointList(obj, attr, value, isFn):
     if not isinstance(value, list):
         typeError(obj, attr, value, 'list', isFn)
     for point in value:
+        # Fast path for a valid point; checkPoint raises the errors otherwise
+        if (
+            type(point) is list
+            and len(point) == 2
+            and isinstance(point[0], (int, float))
+            and isinstance(point[1], (int, float))
+        ):
+            continue
         checkPoint(obj, attr, point, isFn)
 
 
@@ -1062,10 +1111,71 @@ activeDrawing = Drawing()
 
 
 def shape_property(getter, setter=None):
+    # Every shape attribute read goes through here, so this inlines
+    # utils.truncateIntegerFloats
     def shape_getter(self):
-        return utils.truncateIntegerFloats(getter(self))
+        value = getter(self)
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
 
     return property(shape_getter, setter)
+
+
+def _topLevelGroupShape():
+    # activeDrawing.tlg is the app's group as students see it (a
+    # cmu_graphics.Group), which wraps the Group that shapes are added to
+    tlg = activeDrawing.tlg
+    return getattr(tlg, '_shape', tlg)
+
+
+def addToTopLevelGroup(shape):
+    # Same as activeDrawing.tlg.add(shape), which goes through
+    # cmu_graphics.Shape.__getattr__ and slGet/slApply to call this
+    tlgShape = _topLevelGroupShape()
+    if isinstance(tlgShape, Group):
+        tlgShape.add(shape)
+    else:
+        activeDrawing.tlg.add(shape)
+
+
+# Translated default attribute values, by language then attribute name. Only
+# for shapeAttrDefaults, and only defaults that t() accepts (it raises for
+# unhashable ones like []).
+_translatedDefaults = {}
+_NO_DEFAULT = object()
+
+
+def translatedDefault(attrDefaults, name):
+    if attrDefaults is not shapeAttrDefaults:
+        return t(attrDefaults[name])
+    byName = _translatedDefaults.get(cmuGraphicsLanguage)
+    if byName is None:
+        byName = _translatedDefaults[cmuGraphicsLanguage] = {}
+    value = byName.get(name, _NO_DEFAULT)
+    if value is _NO_DEFAULT:
+        value = t(attrDefaults[name])
+        byName[name] = value
+    return value
+
+
+def attr_property(name, getter, setter=None):
+    # The same as shape_property(getter, setter), for a getter that only
+    # returns self.get(name), with Shape.get and shape_getter inlined. Shape
+    # attributes are read many times per shape per frame, and this saves
+    # three function calls per read.
+    def attr_getter(self):
+        attrs = self.attrs
+        if name in attrs:
+            value = attrs[name]
+        else:
+            # Translate so the default shape fill is determined by user language
+            value = translatedDefault(self.attrDefaults, name)
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    return property(attr_getter, setter)
 
 
 class Shape(object):
@@ -1093,13 +1203,14 @@ class Shape(object):
         if (not attrs or not attrs.get('noGroup', False)) and (
             activeDrawing.tlg is not None
         ):
-            activeDrawing.tlg.add(self)
+            addToTopLevelGroup(self)
 
     def get(self, attr):
-        if attr in self.attrs:
-            return self.attrs[attr]
+        attrs = self.attrs
+        if attr in attrs:
+            return attrs[attr]
         # Translate so the default shape fill is determined by user language
-        return t(self.attrDefaults[attr])
+        return translatedDefault(self.attrDefaults, attr)
 
     def setAttr(self, attr, value):
         self.attrs[attr] = value
@@ -1107,12 +1218,15 @@ class Shape(object):
 
     def set(self, attrs):
         result = None
+        ownAttrs = self.attrs
         for attr in attrs:
             value = attrs[attr]
             attrSpec = shapeAttrs.get(attr, None)
             if attrSpec is not None:
                 attrSpec.typeCheckFn(self, attr, value, False)
-            result = self.setAttr(attr, value)
+            # Inlined setAttr
+            ownAttrs[attr] = value
+            result = value
             # TODO: Handle labels
         return result
 
@@ -1232,7 +1346,7 @@ class Shape(object):
         self.scalexy('x', v / self.width)
         self.set({'width': v})
 
-    width = shape_property(get_width, set_width)
+    width = attr_property('width', get_width, set_width)
 
     def get_height(self):
         return self.get('height')
@@ -1241,7 +1355,7 @@ class Shape(object):
         self.scalexy('y', v / self.height)
         self.set({'height': v})
 
-    height = shape_property(get_height, set_height)
+    height = attr_property('height', get_height, set_height)
 
     def get_fill(self):
         return self.get('fill')
@@ -1249,7 +1363,7 @@ class Shape(object):
     def set_fill(self, v):
         return self.set({'fill': v})
 
-    fill = shape_property(get_fill, set_fill)
+    fill = attr_property('fill', get_fill, set_fill)
 
     def get_border(self):
         return self.get('border')
@@ -1257,7 +1371,7 @@ class Shape(object):
     def set_border(self, v):
         return self.set({'border': v})
 
-    border = shape_property(get_border, set_border)
+    border = attr_property('border', get_border, set_border)
 
     def get_borderWidth(self):
         return self.get('borderWidth')
@@ -1265,7 +1379,7 @@ class Shape(object):
     def set_borderWidth(self, v):
         return self.set({'borderWidth': v})
 
-    borderWidth = shape_property(get_borderWidth, set_borderWidth)
+    borderWidth = attr_property('borderWidth', get_borderWidth, set_borderWidth)
 
     def get_dashes(self):
         return self.get('dashes')
@@ -1273,7 +1387,7 @@ class Shape(object):
     def set_dashes(self, v):
         return self.set({'dashes': v})
 
-    dashes = shape_property(get_dashes, set_dashes)
+    dashes = attr_property('dashes', get_dashes, set_dashes)
 
     def get_opacity(self):
         return self.get('opacity')
@@ -1281,7 +1395,7 @@ class Shape(object):
     def set_opacity(self, v):
         return self.set({'opacity': v})
 
-    opacity = shape_property(get_opacity, set_opacity)
+    opacity = attr_property('opacity', get_opacity, set_opacity)
 
     def get_closed(self):
         return self.get('closed')
@@ -1289,7 +1403,7 @@ class Shape(object):
     def set_closed(self, v):
         return self.set({'closed': v})
 
-    closed = shape_property(get_closed, set_closed)
+    closed = attr_property('closed', get_closed, set_closed)
 
     def get_db(self):
         return self.get('db')
@@ -1297,7 +1411,7 @@ class Shape(object):
     def set_db(self, v):
         return self.set({'db': v})
 
-    db = shape_property(get_db, set_db)
+    db = attr_property('db', get_db, set_db)
 
     def get_visible(self):
         return (self._group is not None) and (
@@ -1340,7 +1454,7 @@ class Shape(object):
     def set_rotateAngle(self, v):
         self._rotate(v - self.rotateAngle)
 
-    rotateAngle = shape_property(get_rotateAngle, set_rotateAngle)
+    rotateAngle = attr_property('rotateAngle', get_rotateAngle, set_rotateAngle)
 
     def rotate(self, *arguments):
         checkArgCount(
@@ -1537,19 +1651,30 @@ class Shape(object):
             return g
         if isinstance(fillOrBorder, str):
             fillOrBorder = CSS3_COLORS_TO_RGB[toEnglish(fillOrBorder, 'color').lower()]
-        rgba = (
-            fillOrBorder.red / 255,
-            fillOrBorder.green / 255,
-            fillOrBorder.blue / 255,
-            self.opacity / 100,
-        )
+        if type(fillOrBorder) is RGB:
+            # What RGB.__getattr__ returns for red, green, and blue (whose
+            # names are the same in every language), without translating them
+            rgba = (
+                fillOrBorder._red / 255,
+                fillOrBorder._green / 255,
+                fillOrBorder._blue / 255,
+                self.opacity / 100,
+            )
+        else:
+            rgba = (
+                fillOrBorder.red / 255,
+                fillOrBorder.green / 255,
+                fillOrBorder.blue / 255,
+                self.opacity / 100,
+            )
         return rgba
 
     def setDashes(self, ctx):
-        if isinstance(self.dashes, bool):
-            ctx.set_dash([5, 5] if self.dashes else [])
+        dashes = self.dashes
+        if isinstance(dashes, bool):
+            ctx.set_dash([5, 5] if dashes else [])
         else:
-            ctx.set_dash(self.dashes)
+            ctx.set_dash(dashes)
 
     def drawDbPoint(self, ctx, x, y, color):
         ctx.save()
@@ -1663,8 +1788,9 @@ class Shape(object):
                 self.makePath(ctx)
                 if self.closed:
                     ctx.close_path()
-                if self.fill and len(self.pointList) > 2:
-                    self.setFillOrStrokeStyle(ctx, self.fill)
+                fill = self.fill
+                if fill and len(self.pointList) > 2:
+                    self.setFillOrStrokeStyle(ctx, fill)
                     ctx.fill_preserve()
                 if bw:
                     # (*note) if there is a border, draw with 2x borderWidth,
@@ -1756,7 +1882,9 @@ class Group(Shape):
 
     def add(self, *shapes):
         for i in range(len(shapes)):
-            checkShape(t('Group.add(shape)'), t('shape'), shapes[i], True)
+            # Only translate the error message names when there's an error
+            if not isinstance(shapes[i], Shape):
+                checkShape(t('Group.add(shape)'), t('shape'), shapes[i], True)
             checkRecursiveGroupAddition(self, shapes[i])
             activeDrawing.addCounter += 1
             if activeDrawing.addCounter % 100 == 0:
@@ -2433,7 +2561,7 @@ class Label(Shape):
     def set_width(self, v):
         pyThrow(t("Cannot set Label's width"))
 
-    width = shape_property(get_width, set_width)
+    width = attr_property('width', get_width, set_width)
 
     def get_height(self):
         return self.get('height')
@@ -2441,7 +2569,7 @@ class Label(Shape):
     def set_height(self, v):
         pyThrow(t("Cannot set Label's height"))
 
-    height = shape_property(get_height, set_height)
+    height = attr_property('height', get_height, set_height)
 
     def get_centerX(self):
         return self.get('centerX')
@@ -2451,7 +2579,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    centerX = shape_property(get_centerX, set_centerX)
+    centerX = attr_property('centerX', get_centerX, set_centerX)
 
     def get_centerY(self):
         return self.get('centerY')
@@ -2461,7 +2589,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    centerY = shape_property(get_centerY, set_centerY)
+    centerY = attr_property('centerY', get_centerY, set_centerY)
 
     def get_value(self):
         return self.get('value')
@@ -2472,7 +2600,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    value = shape_property(get_value, set_value)
+    value = attr_property('value', get_value, set_value)
 
     def get_font(self):
         return self.get('font')
@@ -2483,7 +2611,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    font = shape_property(get_font, set_font)
+    font = attr_property('font', get_font, set_font)
 
     def get_size(self):
         return self.get('size')
@@ -2493,7 +2621,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    size = shape_property(get_size, set_size)
+    size = attr_property('size', get_size, set_size)
 
     def get_bold(self):
         return self.get('bold')
@@ -2503,7 +2631,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    bold = shape_property(get_bold, set_bold)
+    bold = attr_property('bold', get_bold, set_bold)
 
     def get_italic(self):
         return self.get('italic')
@@ -2513,7 +2641,7 @@ class Label(Shape):
         self.setDims()
         return v
 
-    italic = shape_property(get_italic, set_italic)
+    italic = attr_property('italic', get_italic, set_italic)
 
     def toString(self):
         return f'{t("Label")}({self.value}, {self.centerX}, {self.centerY})'
@@ -2526,10 +2654,14 @@ class Polygon(Shape):
                 pyThrow(
                     t('Must have an even number of x,y values in initialPoints list')
                 )
-            for i in range(0, len(attrs['initialPoints']), 2):
-                x, y = attrs['initialPoints'][i], attrs['initialPoints'][i + 1]
-                checkNumber(t('Polygon'), t('initialPoints (x value)'), x, False)
-                checkNumber(t('Polygon'), t('initialPoints (y value)'), y, False)
+            initialPoints = attrs['initialPoints']
+            for i in range(0, len(initialPoints), 2):
+                x, y = initialPoints[i], initialPoints[i + 1]
+                # Only translate the error message names when there's an error
+                if not isinstance(x, (int, float)):
+                    checkNumber(t('Polygon'), t('initialPoints (x value)'), x, False)
+                if not isinstance(y, (int, float)):
+                    checkNumber(t('Polygon'), t('initialPoints (y value)'), y, False)
 
         super().__init__(attrs)
         self._cachedCentroid = self._cachedArea = None
@@ -2549,7 +2681,7 @@ class Polygon(Shape):
         self.set({'pointList': pl})
         self.setDims()
 
-    pointList = shape_property(get_pointList, set_pointList)
+    pointList = attr_property('pointList', get_pointList, set_pointList)
 
     def get_area(self):
         if self._cachedArea is None:
@@ -2610,7 +2742,7 @@ class Polygon(Shape):
         # with what the user gave so that there are no rounding errors.
         self.set({'centerX': v})
 
-    centerX = shape_property(get_centerX, set_centerX)
+    centerX = attr_property('centerX', get_centerX, set_centerX)
 
     def get_centerY(self):
         return self.get('centerY')
@@ -2621,7 +2753,7 @@ class Polygon(Shape):
         # with what the user gave so that there are no rounding errors.
         self.set({'centerY': v})
 
-    centerY = shape_property(get_centerY, set_centerY)
+    centerY = attr_property('centerY', get_centerY, set_centerY)
 
     def get_left(self):
         return utils.min_or_inf(list(map(lambda point: point[0], self.pointList)))
@@ -2897,7 +3029,7 @@ class Line(Polygon):
     def set_arrowStart(self, v):
         return self.set({'arrowStart': v})
 
-    arrowStart = shape_property(get_arrowStart, set_arrowStart)
+    arrowStart = attr_property('arrowStart', get_arrowStart, set_arrowStart)
 
     def get_arrowEnd(self):
         return self.get('arrowEnd')
@@ -2905,7 +3037,7 @@ class Line(Polygon):
     def set_arrowEnd(self, v):
         return self.set({'arrowEnd': v})
 
-    arrowEnd = shape_property(get_arrowEnd, set_arrowEnd)
+    arrowEnd = attr_property('arrowEnd', get_arrowEnd, set_arrowEnd)
 
     def get_lineWidth(self):
         pts = self.pointList
@@ -3027,7 +3159,7 @@ class PolygonInCircle(Polygon):
         self.updatePointList()
         return v
 
-    radius = shape_property(get_radius, set_radius)
+    radius = attr_property('radius', get_radius, set_radius)
 
     def get_points(self):
         return self.get('points')
@@ -3037,7 +3169,7 @@ class PolygonInCircle(Polygon):
         self.updatePointList()
         return v
 
-    points = shape_property(get_points, set_points)
+    points = attr_property('points', get_points, set_points)
 
     def get_centerX(self):
         return utils.round2(self.centroid[0])
@@ -3124,7 +3256,9 @@ class PolygonWithTransform(Polygon):
     def set_transformMatrix(self, v):
         return self.set({'transformMatrix': v})
 
-    transformMatrix = shape_property(get_transformMatrix, set_transformMatrix)
+    transformMatrix = attr_property(
+        'transformMatrix', get_transformMatrix, set_transformMatrix
+    )
 
     def multMat(self, trans):
         newTrans = [[0, 0], [0, 0]]
@@ -3188,7 +3322,7 @@ class CMUImage(PolygonWithTransform):
     def set_url(self, v):
         pyThrow(t("Cannot set Image's url"))
 
-    url = shape_property(get_url, set_url)
+    url = attr_property('url', get_url, set_url)
 
     def getScaleAnchor(self):
         return [self.left, self.top]
@@ -3252,8 +3386,38 @@ class Oval(PolygonWithTransform):
         )
         super().__init__(attrs)
 
+    # The Bezier points only depend on the angles, which are usually the same
+    # for every oval, so remember them. Each oval gets its own copy, since the
+    # lists are mutable. The key includes the argument types, so for example
+    # 90 and 90.0 have separate entries.
+    _bezierPointsCache = {}
+
     @staticmethod
     def getBezierPoints(startAngle, sweepAngle, isMvc):
+        if type(startAngle) in (int, float) and type(sweepAngle) in (int, float):
+            cache = Oval._bezierPointsCache
+            key = (
+                startAngle,
+                type(startAngle),
+                sweepAngle,
+                type(sweepAngle),
+                bool(isMvc),
+            )
+            points = cache.get(key)
+            if points is None:
+                if len(cache) >= 4096:
+                    cache.clear()
+                points = cache[key] = tuple(
+                    (x, y)
+                    for [x, y] in Oval._computeBezierPoints(
+                        startAngle, sweepAngle, isMvc
+                    )
+                )
+            return [[x, y] for (x, y) in points]
+        return Oval._computeBezierPoints(startAngle, sweepAngle, isMvc)
+
+    @staticmethod
+    def _computeBezierPoints(startAngle, sweepAngle, isMvc):
         offset = utils.toRadians(startAngle)
         remaining = sweepAngle
         bp = []
@@ -3298,7 +3462,7 @@ class Oval(PolygonWithTransform):
     def set_bezierPoints(self, v):
         return self.set({'bezierPoints': v})
 
-    bezierPoints = shape_property(get_bezierPoints, set_bezierPoints)
+    bezierPoints = attr_property('bezierPoints', get_bezierPoints, set_bezierPoints)
 
     def get_translation(self):
         return self.get('translation')
@@ -3306,27 +3470,18 @@ class Oval(PolygonWithTransform):
     def set_translation(self, v):
         return self.set({'translation': v})
 
-    translation = shape_property(get_translation, set_translation)
+    translation = attr_property('translation', get_translation, set_translation)
 
     def makePath(self, ctx):
         # this code used to use translate, but now performs translation as part of bp calculation
         ctx.new_path()
         tx, ty = self.translation[0], self.translation[1]
-        bp = list(
-            map(
-                (
-                    lambda p: [
-                        self.transformMatrix[0][0] * p[0]
-                        + self.transformMatrix[0][1] * p[1]
-                        + tx,
-                        self.transformMatrix[1][0] * p[0]
-                        + self.transformMatrix[1][1] * p[1]
-                        + ty,
-                    ]
-                ),
-                self.bezierPoints,
-            )
-        )
+        # Read the matrix once, instead of four times per point
+        [[m00, m01], [m10, m11]] = self.transformMatrix
+        bp = [
+            [m00 * p[0] + m01 * p[1] + tx, m10 * p[0] + m11 * p[1] + ty]
+            for p in self.bezierPoints
+        ]
         if isinstance(self, Arc):
             ctx.move_to(tx, ty)
             ctx.line_to(bp[0][0], bp[0][1])
@@ -3385,7 +3540,7 @@ class Arc(Oval):
     def set_ovalWidth(self, v):
         return self.set({'ovalWidth': v})
 
-    ovalWidth = shape_property(get_ovalWidth, set_ovalWidth)
+    ovalWidth = attr_property('ovalWidth', get_ovalWidth, set_ovalWidth)
 
     def get_ovalHeight(self):
         return self.get('ovalHeight')
@@ -3393,7 +3548,7 @@ class Arc(Oval):
     def set_ovalHeight(self, v):
         return self.set({'ovalHeight': v})
 
-    ovalHeight = shape_property(get_ovalHeight, set_ovalHeight)
+    ovalHeight = attr_property('ovalHeight', get_ovalHeight, set_ovalHeight)
 
     def doRotate(self, degrees, cx, cy):
         super().doRotate(degrees, cx, cy)
@@ -3421,7 +3576,7 @@ class Arc(Oval):
         self.regeneratePoints()
         return v
 
-    startAngle = shape_property(get_startAngle, set_startAngle)
+    startAngle = attr_property('startAngle', get_startAngle, set_startAngle)
 
     def get_sweepAngle(self):
         return self.get('sweepAngle')
@@ -3431,12 +3586,12 @@ class Arc(Oval):
         self.regeneratePoints()
         return v
 
-    sweepAngle = shape_property(get_sweepAngle, set_sweepAngle)
+    sweepAngle = attr_property('sweepAngle', get_sweepAngle, set_sweepAngle)
 
     def get_isMvc(self):
         return self.get('isMvc')
 
-    isMvc = shape_property(get_isMvc)
+    isMvc = attr_property('isMvc', get_isMvc)
 
     def regeneratePoints(self):
         self.pointList = utils.getArcPoints(
@@ -3517,7 +3672,7 @@ class Circle(Oval):
     def set__exactRadius(self, v):
         return self.set({'_exactRadius': v})
 
-    _exactRadius = shape_property(get__exactRadius, set__exactRadius)
+    _exactRadius = attr_property('_exactRadius', get__exactRadius, set__exactRadius)
 
     def get_width(self):
         return super().get_width()

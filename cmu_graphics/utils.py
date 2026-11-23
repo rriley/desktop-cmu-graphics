@@ -218,7 +218,14 @@ def rotatePoint(pt, degrees, cx, cy):
 
 
 def rotatePoints(pts, degrees, cx, cy):
-    return list(map(lambda pt: rotatePoint(pt, degrees, cx, cy), pts))
+    # Same arithmetic as rotatePoint, but with the sine and cosine computed
+    # once for all the points
+    cos = intCos(degrees)
+    sin = intSin(degrees)
+    return [
+        [cx + ((x - cx) * cos - (y - cy) * sin), cy + ((x - cx) * sin + (y - cy) * cos)]
+        for [x, y] in pts
+    ]
 
 
 def getBoxDims(pts):
@@ -244,7 +251,13 @@ def flatten(a):
     out = []
     for elem in a:
         if isinstance(elem, list):
-            out.extend(flatten(elem))
+            # Points are lists of numbers, so usually there's nothing further
+            # to flatten and this doesn't need to recurse
+            for inner in elem:
+                if isinstance(inner, list):
+                    out.extend(flatten(inner))
+                else:
+                    out.append(inner)
         else:
             out.append(elem)
     return out
@@ -290,16 +303,48 @@ def getArcPoints(
         pts.append([cx, cy])
     n = rounded(6 + 18 * sizeForN / 50)
     n = math.ceil(n / 4) * 4
+    for cos, sin in _arcAngles(n, startAngle, sweepAngle, isMvc):
+        pts.append([cx + a * cos, cy - b * sin])
+    return pts
+
+
+# Ovals are rebuilt every frame in CPCS Mode, almost always with the same few
+# angles and point counts, so remember the cosines and sines of each set of
+# angles. Keys include the argument types so that, for example, 90 and 90.0
+# don't share an entry (their results are the same, but this makes it so we
+# don't have to rely on that).
+_arcAnglesCache = {}
+
+
+def _arcAngles(n, startAngle, sweepAngle, isMvc):
+    cacheable = type(startAngle) in (int, float) and type(sweepAngle) in (int, float)
+    if cacheable:
+        key = (
+            n,
+            startAngle,
+            type(startAngle),
+            sweepAngle,
+            type(sweepAngle),
+            bool(isMvc),
+        )
+        angles = _arcAnglesCache.get(key)
+        if angles is not None:
+            return angles
+
     denominator = n if sweepAngle == 360 else n - 1
     startAngle = toRadians(startAngle) if isMvc else toRadians(90 - startAngle)
     sweepAngle = toRadians(sweepAngle)
     multiplyFactor = 1 if isMvc else -1
+    angles = []
     for i in range(n):
         theta = startAngle + (multiplyFactor * (sweepAngle * i / denominator))
-        x = cx + a * math.cos(theta)
-        y = cy - b * math.sin(theta)
-        pts.append([x, y])
-    return pts
+        angles.append((math.cos(theta), math.sin(theta)))
+
+    if cacheable:
+        if len(_arcAnglesCache) >= 4096:
+            _arcAnglesCache.clear()
+        _arcAnglesCache[key] = angles
+    return angles
 
 
 def isNumber(value):

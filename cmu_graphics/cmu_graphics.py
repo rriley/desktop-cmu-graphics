@@ -519,15 +519,22 @@ class NoMvc:
 
 def makeDrawFn(shape):
     def drawFn(*args, **kwargs):
-        if not app._app._isMvc:
+        appImpl = app._app
+        if not appImpl._isMvc:
             raise Exception(
                 f'You called draw{shape.__name__} (a CPCS Mode function) outside of redrawAll.'
             )
-        if not app._app.inRedrawAll:
+        if not appImpl.inRedrawAll:
             raise MvcException('Cannot draw (modify the view) outside of redrawAll')
-        with NoMvc():
+        # The same as `with NoMvc():`, which costs more than this, and this
+        # runs for every shape drawn
+        oldMvc = appImpl._isMvc
+        appImpl._isMvc = False
+        try:
             kwargs['isMvc'] = True
             shape(*args, **kwargs)
+        finally:
+            app._app._isMvc = oldMvc
 
     return drawFn
 
@@ -1269,6 +1276,13 @@ class AppWrapper(object):
         ]
     )
     allAttrs = readOnlyAttrs | readWriteAttrs
+    # allAttrs, plus every name that toEnglish(name, 'app-attr') could
+    # translate to a different name (it returns any other name unchanged)
+    translatableOrAppAttrs = frozenset(allAttrs).union(
+        name
+        for names in shape_logic.REVERSE_TRANSLATED_APP_ATTRS.values()
+        for name in names
+    )
     stateHashAttrs = readWriteAttrs - {'group', 'disableMvcChecker'}
 
     def __init__(self, app):
@@ -1283,10 +1297,17 @@ class AppWrapper(object):
         return sorted(fields)
 
     def __getattribute__(self, attr):
+        # The framework reads app._app constantly, so skip translating it
+        if attr == '_app':
+            return object.__getattribute__(self, '_app')
+        # The app's own variables, like app.score: names that no language
+        # translates, and that aren't App attributes
+        if attr not in AppWrapper.translatableOrAppAttrs:
+            return object.__getattribute__(self, attr)
         attr = toEnglish(attr, 'app-attr')
         if attr == '_app' or attr not in AppWrapper.allAttrs:
-            return super().__getattribute__(attr)
-        return self._app.__getattribute__(attr)
+            return object.__getattribute__(self, attr)
+        return object.__getattribute__(self, '_app').__getattribute__(attr)
 
     def __setattr__(self, attr, value):
         attr = toEnglish(attr, 'app-attr')
@@ -1727,7 +1748,8 @@ slInitShape = sli.slInitShape
 slGet = sli.slGet
 rgb = sli.rgb
 gradient = sli.gradient
-toEnglish = sli.toEnglish
+# Bound directly rather than through sli, which only forwards the call
+toEnglish = shape_logic.toEnglish
 accentCombinations = sli.accentCombinations
 t = sli.t
 
