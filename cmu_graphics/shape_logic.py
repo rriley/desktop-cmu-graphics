@@ -4809,11 +4809,15 @@ def _approxOptions(value):
 #            outlines (antialiased a little differently)
 #   borders: draw borders of shapes that are drawn the same way again and
 #            again from cached coverage masks (rounded a little differently)
-APPROX_OPTIONS = frozenset(('text', 'borders'))
+#   thread:  record each frame, and draw it on another thread while the
+#            program works on the next frame, so frames are shown one frame
+#            later than they would be
+APPROX_OPTIONS = frozenset(('text', 'borders', 'thread'))
 APPROX = _approxOptions(os.environ.get('CMU_GRAPHICS_APPROX', ''))
 # (Canvases from before approximate drawing don't have these)
 _APPROX_TEXT = 'text' in APPROX and hasattr(wyvern.Canvas, 'draw_text_approx')
 _APPROX_BORDERS = 'borders' in APPROX and hasattr(wyvern.Canvas, 'draw_text_approx')
+APPROX_THREAD = 'thread' in APPROX and hasattr(wyvern.Canvas, 'begin_frame')
 
 
 # Faster versions of LazyShape draw functions, by the draw function, for

@@ -1198,7 +1198,15 @@ class App(object):
             self._frameChanged = False
             self._inspectorWasDrawn = showInspector
         self.inspector.clearCache()
-        self.redrawAll(ctx)
+        if shape_logic.APPROX_THREAD and type(ctx) is wyvern.Canvas:
+            # Recorded, and drawn on another thread (see Canvas.begin_frame)
+            ctx.begin_frame()
+            try:
+                self.redrawAll(ctx)
+            finally:
+                ctx.end_frame()
+        else:
+            self.redrawAll(ctx)
 
     def shouldDrawInspector(self):
         return self.inspectorEnabled and (

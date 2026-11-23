@@ -768,9 +768,71 @@ impl WyvernImage {
 
 type CanvasSettings = (Font, Vec<Color4f>, Vec<f32>, Paint);
 
+// What Canvas methods draw on: the recording canvas while a frame is being
+// recorded (see begin_frame), otherwise the surface, once the worker that
+// plays a recorded frame onto it is done.
+fn draw_target<'a>(
+    surface: &'a mut skia_safe::Surface,
+    recorder: &'a mut Option<skia_safe::PictureRecorder>,
+    worker: &mut Option<std::thread::JoinHandle<()>>,
+) -> &'a skia_safe::Canvas {
+    if recorder.is_some()
+        && let Some(canvas) = recorder.as_mut().and_then(|r| r.recording_canvas())
+    {
+        return canvas;
+    }
+    if let Some(handle) = worker.take() {
+        let _ = handle.join();
+    }
+    surface.canvas()
+}
+
+macro_rules! target {
+    ($canvas:ident) => {
+        draw_target(
+            &mut $canvas.skia_surface,
+            &mut $canvas.recorder,
+            &mut $canvas.worker,
+        )
+    };
+}
+
+// A recorded frame, for a worker thread to play onto the surface. The
+// surface stays in its Canvas, which doesn't use it until the worker is
+// done (see draw_target).
+struct FrameJob {
+    surface: *mut skia_safe::Surface,
+    picture: skia_safe::Picture,
+}
+
+unsafe impl Send for FrameJob {}
+
+impl FrameJob {
+    fn run(self) {
+        // Safety: the Canvas joins this thread before using the surface again
+        let surface = unsafe { &mut *self.surface };
+        let canvas = surface.canvas();
+        canvas.save();
+        // The picture starts by setting the surface's own matrix
+        canvas.reset_matrix();
+        self.picture.playback(canvas);
+        canvas.restore();
+    }
+}
+
 #[pyclass(unsendable, module = "wyvern")]
 struct Canvas {
     skia_surface: skia_safe::Surface,
+    // The surface's size in pixels, and its matrix (its scale) when nothing
+    // is drawing on it
+    size: (i32, i32),
+    base_matrix: Matrix,
+    // Threaded drawing (see begin_frame): the frame being recorded, the
+    // frame recorded last that hasn't been drawn yet, and the thread
+    // drawing a frame onto the surface
+    recorder: Option<skia_safe::PictureRecorder>,
+    pending: Option<skia_safe::Picture>,
+    worker: Option<std::thread::JoinHandle<()>>,
     path: Option<skia_safe::PathBuilder>,
     font: Font,
     gradient_colors: Vec<Color4f>,
@@ -784,7 +846,7 @@ struct Canvas {
 #[pymethods]
 impl Canvas {
     fn save(&mut self) {
-        self.skia_surface.canvas().save();
+        target!(self).save();
         self.state_stack.push((
             self.font.clone(),
             self.gradient_colors.clone(),
@@ -794,7 +856,7 @@ impl Canvas {
     }
 
     fn restore(&mut self) -> PyResult<()> {
-        self.skia_surface.canvas().restore();
+        target!(self).restore();
         let (prev_font, prev_gcolor, prev_goff, prev_paint) = self
             .state_stack
             .pop()
@@ -807,17 +869,17 @@ impl Canvas {
     }
 
     fn translate(&mut self, x: f32, y: f32) {
-        self.skia_surface.canvas().translate(Vector::new(x, y));
+        target!(self).translate(Vector::new(x, y));
     }
 
     fn rotate(&mut self, angle: f32) {
-        self.skia_surface.canvas().rotate(angle * RAD_TO_DEG, None);
+        target!(self).rotate(angle * RAD_TO_DEG, None);
     }
 
     #[pyo3(signature = (xx = 1.0, yx = 0.0, xy = 0.0, yy = 1.0, x0 = 0.0, y0 = 0.0))]
     fn transform(&mut self, xx: f32, yx: f32, xy: f32, yy: f32, x0: f32, y0: f32) {
         let matrix = Matrix::new_all(xx, xy, x0, yx, yy, y0, 0.0, 0.0, 1.0);
-        self.skia_surface.canvas().concat(&matrix);
+        target!(self).concat(&matrix);
     }
 
     fn new_path(&mut self) {
@@ -988,7 +1050,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas()
+        target!(self)
             .draw_str(&text, point, font, &paint);
         Ok(())
     }
@@ -997,7 +1059,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_alpha_f(a);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_paint(&paint);
+        target!(self).draw_paint(&paint);
     }
 
     fn clip_preserve(&mut self) -> PyResult<()> {
@@ -1008,7 +1070,7 @@ impl Canvas {
                 "Path does not exist for clip_preserve",
             ))
         }?;
-        self.skia_surface.canvas().clip_path(&path, None, true);
+        target!(self).clip_path(&path, None, true);
         Ok(())
     }
 
@@ -1018,7 +1080,7 @@ impl Canvas {
             .take()
             .ok_or(PyRuntimeError::new_err("Path does not exist for clip"))?
             .detach();
-        self.skia_surface.canvas().clip_path(&path, None, true);
+        target!(self).clip_path(&path, None, true);
         Ok(())
     }
 
@@ -1033,7 +1095,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(true);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_path(&path, &paint);
+        target!(self).draw_path(&path, &paint);
         Ok(())
     }
 
@@ -1046,7 +1108,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(true);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_path(&path, &paint);
+        target!(self).draw_path(&path, &paint);
         Ok(())
     }
 
@@ -1061,7 +1123,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &path, &paint); }
+        { let bounds = self.bounds(); fill_path(target!(self), bounds, &mut self.fill_cache, &path, &paint); }
         Ok(())
     }
 
@@ -1074,7 +1136,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &path, &paint); }
+        { let bounds = self.bounds(); fill_path(target!(self), bounds, &mut self.fill_cache, &path, &paint); }
         Ok(())
     }
 
@@ -1142,7 +1204,7 @@ impl Canvas {
         let mut paint = Paint::default();
         paint.set_alpha_f(a);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_image_with_sampling_options(
+        target!(self).draw_image_with_sampling_options(
             &image.image,
             Point::new(x, y),
             skia_safe::SamplingOptions::new(
@@ -1226,7 +1288,7 @@ impl Canvas {
             paint.set_color4f(Color4f::new(r, g, b, a), None);
             paint.set_stroke(false);
             paint.set_anti_alias(true);
-            { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
+            { let bounds = self.bounds(); fill_path(target!(self), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
         }
         match border {
             Some((r, g, b, a)) => {
@@ -1245,7 +1307,7 @@ impl Canvas {
                     color_paint.set_anti_alias(true);
                     let bounds = self.bounds();
                     border_with_mask(
-                        self.skia_surface.canvas(),
+                        target!(self),
                         bounds,
                         &mut self.fill_cache,
                         &pb.snapshot(),
@@ -1256,7 +1318,7 @@ impl Canvas {
                     )
                 };
                 if !drawn {
-                    let canvas = self.skia_surface.canvas();
+                    let canvas = target!(self);
                     canvas.save();
                     canvas.clip_path(&pb.snapshot(), None, true);
                     canvas.draw_path(&pb.detach(), &paint);
@@ -1310,7 +1372,7 @@ impl Canvas {
         paint.set_color4f(Color4f::new(r, g, b, a), None);
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        { let bounds = self.bounds(); fill_path(self.skia_surface.canvas(), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
+        { let bounds = self.bounds(); fill_path(target!(self), bounds, &mut self.fill_cache, &pb.snapshot(), &paint); }
         match border {
             Some((r, g, b, a)) => {
                 let mut paint = self.paint.clone();
@@ -1319,7 +1381,7 @@ impl Canvas {
                 paint.set_stroke_width(border_width);
                 paint.set_stroke(true);
                 paint.set_anti_alias(true);
-                self.skia_surface.canvas().draw_path(&pb.detach(), &paint);
+                target!(self).draw_path(&pb.detach(), &paint);
                 self.path = None;
             }
             None => self.path = Some(pb),
@@ -1364,7 +1426,7 @@ impl Canvas {
         paint.set_color4f(Color4f::new(r, g, b, a), None);
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas()
+        target!(self)
             .draw_str(&text, point, &font, &paint);
         let mut pb = PathBuilder::new();
         pb.move_to(point);
@@ -1372,8 +1434,57 @@ impl Canvas {
         Ok(())
     }
 
+    // Threaded drawing: Canvas calls between begin_frame and end_frame are
+    // recorded, not drawn. start_frame draws the recorded frame on another
+    // thread, so the program can get on with the next frame meanwhile.
+    // Anything that uses the surface (drawing on it outside of a recording,
+    // save_png, showing it) waits for that thread first.
+    fn begin_frame(&mut self) {
+        let mut recorder = skia_safe::PictureRecorder::new();
+        let (width, height) = self.size;
+        let canvas = recorder.begin_recording(Rect::from_iwh(width, height), false);
+        canvas.set_matrix(&skia_safe::M44::from(self.base_matrix));
+        self.recorder = Some(recorder);
+    }
+
+    fn end_frame(&mut self) {
+        if let Some(mut recorder) = self.recorder.take() {
+            self.pending = recorder.finish_recording_as_picture(None);
+        }
+    }
+
+    // Waits for the frame being drawn, then starts drawing the frame
+    // recorded last (if there is one)
+    fn start_frame(&mut self) {
+        self.join_worker();
+        if let Some(picture) = self.pending.take() {
+            let job = FrameJob {
+                surface: &mut self.skia_surface,
+                picture,
+            };
+            self.worker = Some(std::thread::spawn(move || job.run()));
+        }
+    }
+
+    // Waits until every recorded frame is drawn
+    fn finish_frames(&mut self) {
+        self.join_worker();
+        if let Some(picture) = self.pending.take() {
+            FrameJob {
+                surface: &mut self.skia_surface,
+                picture,
+            }
+            .run();
+        }
+    }
+
     fn resize_canvas(&mut self, width: i32, height: i32, scale_factor: f64) -> PyResult<()> {
+        self.join_worker();
+        self.pending = None;
+        self.recorder = None;
         self.skia_surface = create_skia_surface(width, height, scale_factor)?;
+        self.size = (self.skia_surface.width(), self.skia_surface.height());
+        self.base_matrix = Matrix::scale((scale_factor as f32, scale_factor as f32));
         self.path = None;
         self.state_stack.clear();
         self.fill_cache.clear();
@@ -1381,6 +1492,7 @@ impl Canvas {
     }
 
     fn save_png(&mut self, path: String) -> PyResult<()> {
+        self.finish_frames();
         let image = self.skia_surface.image_snapshot();
         let data = image
             .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
@@ -1416,8 +1528,20 @@ fn plain_numbers(values: &Bound<'_, pyo3::types::PyTuple>) -> bool {
 }
 
 impl Canvas {
-    fn bounds(&mut self) -> skia_safe::IRect {
-        skia_safe::IRect::from_wh(self.skia_surface.width(), self.skia_surface.height())
+    fn bounds(&self) -> skia_safe::IRect {
+        skia_safe::IRect::from_wh(self.size.0, self.size.1)
+    }
+
+    fn join_worker(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        self.join_worker();
     }
 }
 
@@ -1469,6 +1593,7 @@ impl ImageSurface {
     fn create(width: i32, height: i32, scale_factor: f64) -> PyResult<Self> {
         Python::attach(|py| {
             let skia_surface = create_skia_surface(width, height, scale_factor)?;
+            let size = (skia_surface.width(), skia_surface.height());
             let style = FontStyle::new(
                 font_style::Weight::NORMAL,
                 font_style::Width::NORMAL,
@@ -1479,6 +1604,11 @@ impl ImageSurface {
                 py,
                 Canvas {
                     skia_surface,
+                    size,
+                    base_matrix: Matrix::scale((scale_factor as f32, scale_factor as f32)),
+                    recorder: None,
+                    pending: None,
+                    worker: None,
                     path: None,
                     font: Font::from_typeface(arial, 12.0),
                     gradient_colors: Vec::new(),
@@ -2134,6 +2264,9 @@ impl WinitApp {
         let result = Python::attach(|py| -> PyResult<()> {
             let surface_ref = py_surface.borrow(py);
             let mut canvas_ref = surface_ref.canvas.bind(py).borrow_mut();
+            // With threaded drawing, show the frame drawn last, and start
+            // drawing the frame recorded just now once that's done (below)
+            canvas_ref.join_worker();
             let pixmap = canvas_ref
                 .skia_surface
                 .peek_pixels()
@@ -2150,6 +2283,8 @@ impl WinitApp {
                 let rgba = rgba.try_into().map_or(0, u32::from_le_bytes);
                 *pixel = ((rgba & 0xff) << 16) | (rgba & 0xff00) | ((rgba >> 16) & 0xff);
             }
+            drop(pixmap);
+            canvas_ref.start_frame();
             if safe_len < buffer.len() {
                 return Ok(());
             }
