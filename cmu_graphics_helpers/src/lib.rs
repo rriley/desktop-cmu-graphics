@@ -1073,6 +1073,150 @@ impl Canvas {
         );
     }
 
+    // Drawing a shape takes Python ten or more Canvas calls (save, new_path,
+    // the points, set_source_rgba, fill_preserve, restore, ...), and each call
+    // costs more than filling a small shape does. draw_closed_shape and
+    // draw_text each draw a shape with one call, with exactly the same Skia
+    // operations, in the same order, as the calls they stand for (see
+    // _drawLazyFlatPolygon, _drawLazyFlatOval and _drawLazyLabel in shape_logic.py),
+    // and leave the Canvas the same way they would.
+
+    // The calls (between a save and a restore) for a closed shape:
+    //   new_path(); <the path>; close_path(); [set_source_rgba(*fill);
+    //   fill_preserve()]; [clip_preserve(); set_source_rgba(*border);
+    //   set_dash([5, 5] if dashed else []); set_line_width(border_width);
+    //   stroke()]
+    // kind 0 is a polygon: coords are its points' x and y, and the path is
+    // move_to(the last point), then line_to each point.
+    // kind 1 is an oval: coords are its bezier points' x and y, and the path
+    // is move_to(the first point), curve_to for each next 3 points (while
+    // there are 4 left to start from), then close_path().
+    #[pyo3(signature = (kind, coords, fill, border, border_width, dashed))]
+    fn draw_closed_shape(
+        &mut self,
+        kind: u8,
+        coords: Vec<f32>,
+        fill: Option<(f32, f32, f32, f32)>,
+        border: Option<(f32, f32, f32, f32)>,
+        border_width: f32,
+        dashed: bool,
+    ) -> PyResult<()> {
+        let n = coords.len() / 2;
+        if n == 0 || coords.len() % 2 != 0 {
+            return Err(PyRuntimeError::new_err(
+                "draw_closed_shape needs an x and y for each point",
+            ));
+        }
+        let point = |i: usize| Point::new(coords[2 * i], coords[2 * i + 1]);
+        let mut pb = PathBuilder::new();
+        match kind {
+            0 => {
+                pb.move_to(point(n - 1));
+                for i in 0..n {
+                    pb.line_to(point(i));
+                }
+            }
+            1 => {
+                pb.move_to(point(0));
+                for i in 0..n / 4 {
+                    let i2 = i * 4;
+                    pb.cubic_to(point(i2 + 1), point(i2 + 2), point(i2 + 3));
+                }
+                pb.close();
+            }
+            _ => return Err(PyRuntimeError::new_err("Unknown kind for draw_closed_shape")),
+        }
+        pb.close();
+        if let Some((r, g, b, a)) = fill {
+            let mut paint = self.paint.clone();
+            paint.set_shader(None);
+            paint.set_color4f(Color4f::new(r, g, b, a), None);
+            paint.set_stroke(false);
+            paint.set_anti_alias(true);
+            fill_path(&mut self.skia_surface, &mut self.fill_cache, &pb.snapshot(), &paint);
+        }
+        match border {
+            Some((r, g, b, a)) => {
+                let mut paint = self.paint.clone();
+                paint.set_shader(None);
+                paint.set_color4f(Color4f::new(r, g, b, a), None);
+                let dashes: &[f32] = if dashed { &[5.0, 5.0] } else { &[] };
+                paint.set_path_effect(PathEffect::dash(dashes, 0.0));
+                paint.set_stroke_width(border_width);
+                paint.set_stroke(true);
+                paint.set_anti_alias(true);
+                let canvas = self.skia_surface.canvas();
+                canvas.save();
+                canvas.clip_path(&pb.snapshot(), None, true);
+                canvas.draw_path(&pb.detach(), &paint);
+                canvas.restore();
+                // stroke() uses up the path
+                self.path = None;
+            }
+            None => self.path = Some(pb),
+        }
+        Ok(())
+    }
+
+    // The calls (between a save and a restore) for a Label:
+    //   select_font_face(family, weight, slant); set_font_size(size);
+    //   new_path(); move_to(x, y); text_path(text); set_source_rgba(*fill);
+    //   fill_preserve(); [set_source_rgba(*border);
+    //   set_line_width(border_width); stroke()]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (text, x, y, family, weight, slant, size, fill, border, border_width))]
+    fn draw_text(
+        &mut self,
+        text: String,
+        x: f32,
+        y: f32,
+        family: String,
+        weight: FontWeight,
+        slant: FontSlant,
+        size: f32,
+        fill: (f32, f32, f32, f32),
+        border: Option<(f32, f32, f32, f32)>,
+        border_width: f32,
+    ) -> PyResult<()> {
+        let style = FontStyle::new(
+            py_to_skia_weight(weight),
+            font_style::Width::NORMAL,
+            py_to_skia_slant(slant),
+        );
+        let mut font = self.font.clone();
+        font.set_typeface(cached_typeface(&family, style)?);
+        font.set_size(size);
+        let point = Point::new(x, y);
+        let mut pb = PathBuilder::new();
+        pb.move_to(point);
+        let text_path = self.text_cache.path(text, point, &font);
+        pb.add_path(&text_path, None);
+
+        let (r, g, b, a) = fill;
+        let mut paint = self.paint.clone();
+        paint.set_shader(None);
+        paint.set_color4f(Color4f::new(r, g, b, a), None);
+        paint.set_stroke(false);
+        paint.set_anti_alias(true);
+        fill_path(&mut self.skia_surface, &mut self.fill_cache, &pb.snapshot(), &paint);
+        match border {
+            Some((r, g, b, a)) => {
+                let mut paint = self.paint.clone();
+                paint.set_shader(None);
+                paint.set_color4f(Color4f::new(r, g, b, a), None);
+                paint.set_stroke_width(border_width);
+                paint.set_stroke(true);
+                paint.set_anti_alias(true);
+                self.skia_surface
+                    .canvas()
+                    .draw_path(&pb.detach(), &paint);
+                self.path = None;
+            }
+            None => self.path = Some(pb),
+        }
+        Ok(())
+    }
+
     fn resize_canvas(&mut self, width: i32, height: i32, scale_factor: f64) -> PyResult<()> {
         self.skia_surface = create_skia_surface(width, height, scale_factor)?;
         self.path = None;
@@ -1090,6 +1234,30 @@ impl Canvas {
         file.write_all(data.as_bytes())?;
         Ok(())
     }
+}
+
+// Whether every item of values is exactly an int or a float (not a bool or
+// other subclass) from -1e9 to 1e9, which also rules out NaN. This is the
+// check shape_logic._isPlainNumber makes of each of a drawing call's numbers,
+// for all of them in one call.
+#[pyfunction]
+fn plain_numbers(values: &Bound<'_, pyo3::types::PyTuple>) -> bool {
+    values.iter().all(|value| {
+        let number = if let Ok(float) = value.cast_exact::<pyo3::types::PyFloat>() {
+            float.value()
+        } else if value.is_exact_instance_of::<pyo3::types::PyInt>() {
+            // Ints outside of i64 are outside of the range too. Inside it,
+            // converting to f64 can't move an int across -1e9 or 1e9, which
+            // are exact.
+            match value.extract::<i64>() {
+                Ok(int) => int as f64,
+                Err(_) => return false,
+            }
+        } else {
+            return false;
+        };
+        (-1e9..=1e9).contains(&number)
+    })
 }
 
 fn create_image(data: skia_safe::Data) -> PyResult<WyvernImage> {
@@ -2521,6 +2689,7 @@ fn cmu_graphics_helpers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyvern.add_class::<WyvernImage>()?;
     wyvern.add_function(wrap_pyfunction!(load_image_from_path, &wyvern)?)?;
     wyvern.add_function(wrap_pyfunction!(load_image_from_bytes, &wyvern)?)?;
+    wyvern.add_function(wrap_pyfunction!(plain_numbers, &wyvern)?)?;
     wyvern.add_class::<WyvernSound>()?;
     wyvern.add_class::<PythonEvent>()?;
     wyvern.add_class::<MouseEvent>()?;
