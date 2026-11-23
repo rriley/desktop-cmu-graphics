@@ -721,6 +721,7 @@ class App(object):
 
     def redrawAllWrapper(self):
         self.group.clear()
+        shape_logic.startShapeTemplateFrame()
 
         checkerEnabled = not self.disableMvcChecker
         self.inRedrawAll = True

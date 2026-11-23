@@ -4149,6 +4149,251 @@ class Inspector(object):
             verticalOffset += lineHeight
 
 
+# In CPCS Mode, redrawAll makes all of the app's shapes again every frame,
+# usually with the same arguments as the frame before (think of the cells of a
+# grid, or a background). Making a shape from scratch takes a lot of type
+# checking and geometry, so remember what each drawing call made, and copy it
+# when the same call happens again.
+#
+# Making a shape only depends on its class, its arguments, and the language,
+# so a template is only used for a call with exactly the same ones: the same
+# values, of the same types (so 1, 1.0, and True are different), with keyword
+# arguments in the same order. Templates are only made for calls whose
+# arguments are all numbers, strings, booleans, or None, and only for shapes
+# whose state is made of those and lists and dicts of them.
+#
+# Past MAX_SHAPE_TEMPLATES templates (or keys seen once), the ones that weren't
+# used in the previous frame are dropped when the next frame starts. So the
+# shapes an app draws every frame always keep their templates, however many
+# there are, and templates for shapes it stopped drawing go away.
+MAX_SHAPE_TEMPLATES = 4096
+# Template keys to templates
+SHAPE_TEMPLATES = {}
+# Keys of calls seen once, to the frame they were seen in
+SEEN_SHAPE_TEMPLATE_KEYS = {}
+_shapeTemplateFrame = 0
+
+
+def startShapeTemplateFrame():
+    # Called before each redrawAll
+    global _shapeTemplateFrame
+    _shapeTemplateFrame += 1
+    oldest = _shapeTemplateFrame - 1
+    if len(SHAPE_TEMPLATES) > MAX_SHAPE_TEMPLATES:
+        for key in [k for k, v in SHAPE_TEMPLATES.items() if v.lastUsed < oldest]:
+            del SHAPE_TEMPLATES[key]
+    if len(SEEN_SHAPE_TEMPLATE_KEYS) > MAX_SHAPE_TEMPLATES:
+        for key in [k for k, v in SEEN_SHAPE_TEMPLATE_KEYS.items() if v < oldest]:
+            del SEEN_SHAPE_TEMPLATE_KEYS[key]
+
+
+_TEMPLATE_IMMUTABLE_TYPES = frozenset((int, float, str, bool, type(None)))
+
+
+class _NotTemplatable(Exception):
+    pass
+
+
+def _templateKeyParts(values):
+    # Each value with its type, so that values that compare equal but behave
+    # differently (1, 1.0, and True; 0.0 and -0.0) get different keys. hex()
+    # tells apart floats that compare equal.
+    parts = []
+    for value in values:
+        valueType = type(value)
+        if valueType is float:
+            parts.append(value.hex())
+        elif valueType in _TEMPLATE_IMMUTABLE_TYPES:
+            parts.append(value)
+        else:
+            raise _NotTemplatable()
+        parts.append(valueType)
+    return tuple(parts)
+
+
+def shapeTemplateKey(clsName, args, kwargs, isMvc):
+    # Shape objects (as opposed to drawing functions) are usually made once,
+    # so they don't use templates. Images depend on files, and visible changes
+    # the group a shape is in, so neither uses templates either.
+    if isMvc is not True or clsName == 'Image' or 'visible' in kwargs:
+        return None
+    font = kwargs.get('font')
+    # Setting a font can print a warning (once), which a template would skip
+    if type(font) is str and font.lower() in FONTS_SHOW_WARNING:
+        return None
+    try:
+        return (
+            clsName,
+            cmuGraphicsLanguage,
+            _templateKeyParts(args),
+            tuple(kwargs),
+            _templateKeyParts(kwargs.values()),
+        )
+    except _NotTemplatable:
+        return None
+
+
+# Parts of a shape's state that instantiate() sets itself
+_TEMPLATE_GROUP_FIELDS = frozenset(
+    ('id', '_group', 'oldGroup', 'shapesToBeInFrontOf', 'shapesInOldGroup', 'zindex')
+)
+
+
+def _copyShapeState(value, memo):
+    valueType = type(value)
+    if valueType in _TEMPLATE_IMMUTABLE_TYPES:
+        return value
+    valueId = id(value)
+    if valueId in memo:
+        return memo[valueId]
+    if valueType is list:
+        result = memo[valueId] = []
+        for item in value:
+            result.append(_copyShapeState(item, memo))
+        return result
+    if valueType is dict:
+        result = memo[valueId] = {}
+        for k, v in value.items():
+            if type(k) not in _TEMPLATE_IMMUTABLE_TYPES:
+                raise _NotTemplatable()
+            result[k] = _copyShapeState(v, memo)
+        return result
+    raise _NotTemplatable()
+
+
+def _hasSharedContainers(value, seen):
+    # Whether any list or dict is reachable twice from value
+    valueType = type(value)
+    if valueType is list or valueType is dict:
+        if id(value) in seen:
+            return True
+        seen.add(id(value))
+        items = value if valueType is list else value.values()
+        return any(_hasSharedContainers(item, seen) for item in items)
+    return False
+
+
+def _copyList(value):
+    return value[:]
+
+
+def _copyPointList(value):
+    return [point[:] for point in value]
+
+
+def _makeCopier(value):
+    # Returns a function that copies values shaped like value, or None if
+    # value is immutable and can be shared
+    valueType = type(value)
+    if valueType in _TEMPLATE_IMMUTABLE_TYPES:
+        return None
+    if valueType is list:
+        if all(type(item) in _TEMPLATE_IMMUTABLE_TYPES for item in value):
+            return _copyList
+        if all(
+            type(item) is list
+            and all(type(x) in _TEMPLATE_IMMUTABLE_TYPES for x in item)
+            for item in value
+        ):
+            return _copyPointList
+        return lambda v: _copyShapeState(v, {})
+    if valueType is dict:
+        mutableItems = [
+            (k, copier)
+            for k, copier in ((k, _makeCopier(v)) for k, v in value.items())
+            if copier is not None
+        ]
+
+        def copyDict(v):
+            result = v.copy()
+            for k, copier in mutableItems:
+                result[k] = copier(result[k])
+            return result
+
+        return copyDict
+    raise _NotTemplatable()
+
+
+class ShapeTemplate(object):
+    def __init__(self, cls, fieldNames, state, copiers):
+        self.cls = cls
+        # The last frame (see startShapeTemplateFrame) the template was used in
+        self.lastUsed = 0
+        # The order of the shape's fields, so copies match exactly
+        self.fieldNames = fieldNames
+        self.state = state
+        # None if some list or dict is shared within the state, in which case
+        # everything is copied together with _copyShapeState to keep it shared.
+        # Otherwise, for each field: None for the fields instantiate() sets
+        # itself, or (value, copier), where copier is None if the value is
+        # immutable and can be shared.
+        if copiers is None:
+            self.fields = None
+        else:
+            self.fields = []
+            for name in fieldNames:
+                if name in _TEMPLATE_GROUP_FIELDS:
+                    self.fields.append((name, None))
+                elif name == 'attrDefaults':
+                    self.fields.append((name, (shapeAttrDefaults, None)))
+                else:
+                    self.fields.append((name, (state[name], copiers[name])))
+
+    @staticmethod
+    def make(shape):
+        fieldNames = list(vars(shape))
+        state = {}
+        try:
+            memo = {}
+            for name in fieldNames:
+                if name in _TEMPLATE_GROUP_FIELDS:
+                    continue
+                value = vars(shape)[name]
+                if name == 'attrDefaults':
+                    # The module wide defaults, which copies share
+                    if value is not shapeAttrDefaults:
+                        return None
+                    continue
+                state[name] = _copyShapeState(value, memo)
+            if _hasSharedContainers(list(state.values()), set()):
+                copiers = None
+            else:
+                copiers = {name: _makeCopier(value) for name, value in state.items()}
+        except _NotTemplatable:
+            return None
+        return ShapeTemplate(type(shape), fieldNames, state, copiers)
+
+    def instantiate(self):
+        # A copy of the template, plus what Shape.__init__ does to every shape
+        shape = self.cls.__new__(self.cls)
+        fields = shape.__dict__
+        if self.fields is not None:
+            for name, field in self.fields:
+                if field is None:
+                    fields[name] = None
+                else:
+                    value, copier = field
+                    fields[name] = value if copier is None else copier(value)
+        else:
+            memo = {}
+            for name in self.fieldNames:
+                if name in _TEMPLATE_GROUP_FIELDS:
+                    fields[name] = None
+                elif name == 'attrDefaults':
+                    fields[name] = shapeAttrDefaults
+                else:
+                    fields[name] = _copyShapeState(self.state[name], memo)
+        fields['id'] = activeDrawing.nextShapeId
+        activeDrawing.nextShapeId += 1
+        fields['_group'] = fields['oldGroup'] = None
+        fields['shapesToBeInFrontOf'] = []
+        fields['shapesInOldGroup'] = {}
+        fields['zindex'] = -1
+        if activeDrawing.tlg is not None:
+            addToTopLevelGroup(shape)
+        return shape
+
+
 class ShapeLogicInterface(object):
     def toEnglish(self, *args, **kwargs):
         return toEnglish(*args, **kwargs)
@@ -4247,6 +4492,38 @@ class ShapeLogicInterface(object):
         return activeDrawing.appProperties[propName]
 
     def slInitShape(self, clsName, argNames, args, kwargs, isMvc):
+        key = shapeTemplateKey(clsName, args, kwargs, isMvc)
+        if key is None:
+            return self._slInitShape(clsName, argNames, args, kwargs, isMvc)
+
+        template = SHAPE_TEMPLATES.get(key)
+        if template is not None:
+            template.lastUsed = _shapeTemplateFrame
+            return template.instantiate()
+
+        idBefore = activeDrawing.nextShapeId
+        addsBefore = activeDrawing.addCounter
+        shape = self._slInitShape(clsName, argNames, args, kwargs, isMvc)
+        # Only remember shapes the second time they're drawn, so shapes that
+        # move every frame don't pay to make templates. Making the shape must
+        # have had no side effects other than taking an id and joining the top
+        # level group, which instantiate() repeats.
+        if key in SEEN_SHAPE_TEMPLATE_KEYS:
+            if (
+                activeDrawing.nextShapeId == idBefore + 1
+                and activeDrawing.addCounter == addsBefore + 1
+                and shape.id == idBefore
+                and shape._group is _topLevelGroupShape()
+            ):
+                template = ShapeTemplate.make(shape)
+                if template is not None:
+                    template.lastUsed = _shapeTemplateFrame
+                    SHAPE_TEMPLATES[key] = template
+        else:
+            SEEN_SHAPE_TEMPLATE_KEYS[key] = _shapeTemplateFrame
+        return shape
+
+    def _slInitShape(self, clsName, argNames, args, kwargs, isMvc):
         actualClass = clsName
         if clsName == 'Image':
             actualClass = 'CMUImage'
