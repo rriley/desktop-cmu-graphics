@@ -1476,12 +1476,12 @@ impl WinitApp {
                 PyRuntimeError::new_err("Issue getting bytes from pixel data")
             })?;
             let safe_len = buffer.len().min(bytes.len() / 4);
-            for (i, pixel) in buffer.iter_mut().take(safe_len).enumerate() {
-                let offset = i * 4;
-                let r = bytes[offset] as u32;
-                let g = bytes[offset + 1] as u32;
-                let b = bytes[offset + 2] as u32;
-                *pixel = (r << 16) | (g << 8) | b;
+            // Convert RGBA bytes to softbuffer's 0RGB pixels. Reading each
+            // pixel as one little endian word (R in the low byte) lets the
+            // compiler vectorize this, which matters on slow CPUs.
+            for (pixel, rgba) in buffer.iter_mut().zip(bytes.chunks_exact(4)) {
+                let rgba = rgba.try_into().map_or(0, u32::from_le_bytes);
+                *pixel = ((rgba & 0xff) << 16) | (rgba & 0xff00) | ((rgba >> 16) & 0xff);
             }
             if safe_len < buffer.len() {
                 return Ok(());
