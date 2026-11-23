@@ -243,6 +243,354 @@ fn cached_typeface(family_name: &str, style: FontStyle) -> PyResult<Typeface> {
     })
 }
 
+// Filling a path with many points, like the text of a Label, is slow, because
+// Skia supersamples complex paths to antialias them: about 200us for a line of
+// text, compared to a few microseconds for a circle. Apps usually draw the same
+// text in the same place frame after frame, so FillCache remembers the
+// antialiasing coverage of recently filled paths as alpha masks. Filling a
+// path that's in the cache composites its mask with the paint instead.
+//
+// A mask is only reused for exactly the same path (bit for bit), transformed
+// by exactly the same matrix, so its coverage is what filling the path would
+// compute. Masks are only used when nothing about the fill depends on where
+// it's drawn from (no shader, path effect, filters, or clip).
+const MASK_CACHE_MIN_POINTS: usize = 48;
+const MASK_CACHE_MAX_ENTRIES: usize = 256;
+const MASK_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const MASK_CACHE_MAX_SEEN: usize = 1024;
+
+struct CachedMask {
+    matrix: [u32; 9],
+    fill_type: skia_safe::PathFillType,
+    verbs: Vec<skia_safe::PathVerb>,
+    points: Vec<(u32, u32)>,
+    weights: Vec<u32>,
+    mask: Image,
+    left: i32,
+    top: i32,
+    bytes: usize,
+    last_used: u64,
+}
+
+impl CachedMask {
+    fn matches(&self, key: &MaskKey<'_>) -> bool {
+        self.matrix == key.matrix
+            && self.fill_type == key.path.fill_type()
+            && self.verbs.as_slice() == key.path.verbs()
+            && self.points.len() == key.path.points().len()
+            && self
+                .points
+                .iter()
+                .zip(key.path.points())
+                .all(|(a, b)| *a == (b.x.to_bits(), b.y.to_bits()))
+            && self.weights.len() == key.path.conic_weights().len()
+            && self
+                .weights
+                .iter()
+                .zip(key.path.conic_weights())
+                .all(|(a, b)| *a == b.to_bits())
+    }
+}
+
+struct MaskKey<'a> {
+    path: &'a Path,
+    matrix: [u32; 9],
+    hash: u64,
+}
+
+impl<'a> MaskKey<'a> {
+    fn new(path: &'a Path, matrix: &Matrix) -> Self {
+        let mut matrix_bits = [0u32; 9];
+        for (i, bits) in matrix_bits.iter_mut().enumerate() {
+            *bits = matrix[i].to_bits();
+        }
+        // FNV-1a over 32 bit words. Collisions only cost a cache miss, since
+        // CachedMask::matches compares the paths themselves.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut add = |word: u32| {
+            hash = (hash ^ u64::from(word)).wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        matrix_bits.iter().for_each(|bits| add(*bits));
+        add(path.fill_type() as u32);
+        path.verbs().iter().for_each(|verb| add(*verb as u32));
+        path.points().iter().for_each(|p| {
+            add(p.x.to_bits());
+            add(p.y.to_bits());
+        });
+        path.conic_weights().iter().for_each(|w| add(w.to_bits()));
+        MaskKey {
+            path,
+            matrix: matrix_bits,
+            hash,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FillCache {
+    masks: HashMap<u64, CachedMask>,
+    // Hashes of paths filled once. A path gets a mask the second time it's
+    // filled, so text that changes every frame doesn't pay to make masks.
+    seen: HashMap<u64, ()>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl FillCache {
+    fn clear(&mut self) {
+        self.masks.clear();
+        self.seen.clear();
+        self.bytes = 0;
+    }
+
+    fn evict_until_fits(&mut self, new_bytes: usize) {
+        while !self.masks.is_empty()
+            && (self.masks.len() >= MASK_CACHE_MAX_ENTRIES
+                || self.bytes + new_bytes > MASK_CACHE_MAX_BYTES)
+        {
+            let Some(oldest) = self
+                .masks
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+            if let Some(entry) = self.masks.remove(&oldest) {
+                self.bytes -= entry.bytes;
+            }
+        }
+    }
+}
+
+// Whether filling with this paint looks the same no matter where the fill's
+// coverage comes from.
+fn paint_allows_mask(paint: &Paint) -> bool {
+    paint.shader().is_none()
+        && paint.path_effect().is_none()
+        && paint.mask_filter().is_none()
+        && paint.color_filter().is_none()
+        && paint.image_filter().is_none()
+        && paint.as_blend_mode() == Some(skia_safe::BlendMode::SrcOver)
+}
+
+// Fills path with paint, using a cached coverage mask when possible.
+fn fill_path(surface: &mut skia_safe::Surface, cache: &mut FillCache, path: &Path, paint: &Paint) {
+    if !fill_path_with_mask(surface, cache, path, paint) {
+        surface.canvas().draw_path(path, paint);
+    }
+}
+
+// Returns false if the path wasn't drawn, and should be filled normally.
+fn fill_path_with_mask(
+    surface: &mut skia_safe::Surface,
+    cache: &mut FillCache,
+    path: &Path,
+    paint: &Paint,
+) -> bool {
+    if path.count_points() < MASK_CACHE_MIN_POINTS
+        || path.is_inverse_fill_type()
+        || !path.is_finite()
+        || !paint_allows_mask(paint)
+    {
+        return false;
+    }
+    let surface_bounds = skia_safe::IRect::from_wh(surface.width(), surface.height());
+    let canvas = surface.canvas();
+    // Masks are made without a clip, so only use them when nothing is clipped
+    if !canvas.is_clip_rect() || canvas.device_clip_bounds() != Some(surface_bounds) {
+        return false;
+    }
+    let matrix = canvas.local_to_device_as_3x3();
+    if matrix.has_perspective() {
+        return false;
+    }
+
+    let key = MaskKey::new(path, &matrix);
+    cache.clock += 1;
+    let clock = cache.clock;
+    // An entry that doesn't match is a different path with the same hash,
+    // which gets replaced below
+    if let Some(entry) = cache.masks.get_mut(&key.hash)
+        && entry.matches(&key)
+    {
+        entry.last_used = clock;
+        let (mask, left, top) = (entry.mask.clone(), entry.left, entry.top);
+        return draw_mask(canvas, &mask, left, top, paint);
+    }
+    if cache.seen.remove(&key.hash).is_none() {
+        if cache.seen.len() >= MASK_CACHE_MAX_SEEN {
+            cache.seen.clear();
+        }
+        cache.seen.insert(key.hash, ());
+        return false;
+    }
+
+    // Skia fills a path by transforming it to device space and then computing
+    // its coverage there, so do the same, in a surface that's just big enough.
+    // Moving the device space path by whole pixels to the mask's origin is
+    // exact, so the mask's coverage is the same as the fill's.
+    let device_path = path.with_transform(&matrix);
+    let path_bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(device_path.bounds());
+    let Some(bounds) =
+        skia_safe::IRect::intersect(&path_bounds.with_outset((1, 1)), &surface_bounds)
+    else {
+        return false;
+    };
+    if bounds.is_empty() {
+        return false;
+    }
+    let Some(mut mask_surface) = surfaces::raster(&ImageInfo::new_a8(bounds.size()), None, None)
+    else {
+        return false;
+    };
+    let mut mask_paint = Paint::default();
+    mask_paint.set_anti_alias(paint.is_anti_alias());
+    mask_surface.canvas().draw_path(
+        &device_path.with_offset((-bounds.left() as f32, -bounds.top() as f32)),
+        &mask_paint,
+    );
+    let mask = mask_surface.image_snapshot();
+    let bytes = (bounds.width() as usize) * (bounds.height() as usize);
+
+    if let Some(old) = cache.masks.remove(&key.hash) {
+        cache.bytes -= old.bytes;
+    }
+    cache.evict_until_fits(bytes);
+    cache.bytes += bytes;
+    cache.masks.insert(
+        key.hash,
+        CachedMask {
+            matrix: key.matrix,
+            fill_type: path.fill_type(),
+            verbs: path.verbs().to_vec(),
+            points: path
+                .points()
+                .iter()
+                .map(|p| (p.x.to_bits(), p.y.to_bits()))
+                .collect(),
+            weights: path.conic_weights().iter().map(|w| w.to_bits()).collect(),
+            mask: mask.clone(),
+            left: bounds.left(),
+            top: bounds.top(),
+            bytes,
+            last_used: clock,
+        },
+    );
+    draw_mask(surface.canvas(), &mask, bounds.left(), bounds.top(), paint)
+}
+
+// Composites an alpha mask in device space, colored by paint. Rather than
+// drawing the mask as an image, this fills the mask's rectangle with the mask
+// as a clip. That blends with the same arithmetic as filling the path did:
+// with Skia's image drawing, opaque colors came out up to 1/255 different at
+// the antialiased edges. Returns false if nothing was drawn.
+fn draw_mask(canvas: &skia_safe::Canvas, mask: &Image, left: i32, top: i32, paint: &Paint) -> bool {
+    let Some(shader) = mask.to_shader(
+        (TileMode::Decal, TileMode::Decal),
+        skia_safe::SamplingOptions::default(),
+        &Matrix::translate((left as f32, top as f32)),
+    ) else {
+        return false;
+    };
+    canvas.save();
+    canvas.reset_matrix();
+    canvas.clip_shader(shader, skia_safe::ClipOp::Intersect);
+    canvas.draw_rect(
+        Rect::from_xywh(
+            left as f32,
+            top as f32,
+            mask.width() as f32,
+            mask.height() as f32,
+        ),
+        paint,
+    );
+    canvas.restore();
+    true
+}
+
+// Labels measure their text when they're made and turn it into a path every
+// time they're drawn, which in CPCS Mode is every frame. Both only depend on
+// the text and the font (and the path on where it starts), so remember them.
+const TEXT_CACHE_MAX_ENTRIES: usize = 512;
+
+// Everything about a Font that affects glyph outlines and metrics
+type FontKey = [u32; 7];
+
+fn font_key(font: &Font) -> FontKey {
+    let flags = u32::from(font.is_force_auto_hinting())
+        | u32::from(font.is_embedded_bitmaps()) << 1
+        | u32::from(font.is_subpixel()) << 2
+        | u32::from(font.is_linear_metrics()) << 3
+        | u32::from(font.is_embolden()) << 4
+        | u32::from(font.is_baseline_snap()) << 5;
+    [
+        font.typeface().unique_id(),
+        font.size().to_bits(),
+        font.scale_x().to_bits(),
+        font.skew_x().to_bits(),
+        font.edging() as u32,
+        font.hinting() as u32,
+        flags,
+    ]
+}
+
+type TextExtents = (f32, f32, f32, f32, f32, f32);
+
+#[derive(Default)]
+struct TextCache {
+    paths: HashMap<(String, FontKey, u32, u32), Path>,
+    extents: HashMap<(String, FontKey), TextExtents>,
+}
+
+impl TextCache {
+    fn path(&mut self, text: String, point: Point, font: &Font) -> Path {
+        let key = (text, font_key(font), point.x.to_bits(), point.y.to_bits());
+        if let Some(path) = self.paths.get(&key) {
+            return path.clone();
+        }
+        let path = Path::from_str(&key.0, point, font);
+        if self.paths.len() >= TEXT_CACHE_MAX_ENTRIES {
+            self.paths.clear();
+        }
+        self.paths.insert(key, path.clone());
+        path
+    }
+
+    fn extents(&mut self, text: String, font: &Font, paint: &Paint) -> TextExtents {
+        // Some paints (strokes, path effects, mask filters) make Skia measure
+        // glyphs differently, so only remember measurements with plain fills
+        let cacheable = paint.style() == skia_safe::PaintStyle::Fill
+            && paint.path_effect().is_none()
+            && paint.mask_filter().is_none();
+        let key = (text, font_key(font));
+        if cacheable && let Some(extents) = self.extents.get(&key) {
+            return *extents;
+        }
+        let (width, _) = font.measure_str(&key.0, Some(paint));
+        // Font::measure_str's bounds are the rasterizer's glyph-mask bounds, which
+        // are rounded out to whole pixels and padded for anti-aliasing. Cairo's
+        // text_extents reports the exact outline ink extents, so measure the text
+        // path instead to keep label dimensions the same as they were under cairo.
+        let rect = Path::from_str(&key.0, ORIGIN, font).compute_tight_bounds();
+        let extents = (
+            rect.left(),
+            rect.top(),
+            rect.right() - rect.left(),
+            rect.height(),
+            width,
+            rect.bottom(),
+        );
+        if cacheable {
+            if self.extents.len() >= TEXT_CACHE_MAX_ENTRIES {
+                self.extents.clear();
+            }
+            self.extents.insert(key, extents);
+        }
+        extents
+    }
+}
+
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 enum Gradient {
@@ -348,6 +696,8 @@ struct Canvas {
     gradient_offsets: Vec<f32>,
     paint: Paint,
     state_stack: Vec<CanvasSettings>,
+    fill_cache: FillCache,
+    text_cache: TextCache,
 }
 
 #[pymethods]
@@ -530,34 +880,19 @@ impl Canvas {
         Ok(())
     }
 
-    fn text_extents(&mut self, text: String) -> PyResult<(f32, f32, f32, f32, f32, f32)> {
-        let font = self.font.as_ref();
-        let (width, _) = Font::measure_str(font, &text, Some(&self.paint));
-        // Font::measure_str's bounds are the rasterizer's glyph-mask bounds, which
-        // are rounded out to whole pixels and padded for anti-aliasing. Cairo's
-        // text_extents reports the exact outline ink extents, so measure the text
-        // path instead to keep label dimensions the same as they were under cairo.
-        let rect = Path::from_str(&text, ORIGIN, font).compute_tight_bounds();
-        Ok((
-            rect.left(),
-            rect.top(),
-            rect.right() - rect.left(),
-            rect.height(),
-            width,
-            rect.bottom(),
-        ))
+    fn text_extents(&mut self, text: String) -> PyResult<TextExtents> {
+        Ok(self.text_cache.extents(text, &self.font, &self.paint))
     }
 
     fn text_path(&mut self, text: String) -> PyResult<()> {
-        let font = self.font.as_ref();
         let point = self
             .path
             .as_ref()
             .and_then(|pb| pb.get_last_pt())
             .unwrap_or(ORIGIN);
-        let text_path = Path::from_str(&text, point, font);
+        let text_path = self.text_cache.path(text, point, &self.font);
         self.path
-            .get_or_insert(PathBuilder::new_path(&text_path))
+            .get_or_insert_with(|| PathBuilder::new_path(&text_path))
             .add_path(&text_path, None);
         Ok(())
     }
@@ -646,7 +981,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_path(&path, &paint);
+        fill_path(&mut self.skia_surface, &mut self.fill_cache, &path, &paint);
         Ok(())
     }
 
@@ -659,7 +994,7 @@ impl Canvas {
         let mut paint = self.paint.clone();
         paint.set_stroke(false);
         paint.set_anti_alias(true);
-        self.skia_surface.canvas().draw_path(&path, &paint);
+        fill_path(&mut self.skia_surface, &mut self.fill_cache, &path, &paint);
         Ok(())
     }
 
@@ -742,6 +1077,7 @@ impl Canvas {
         self.skia_surface = create_skia_surface(width, height, scale_factor)?;
         self.path = None;
         self.state_stack.clear();
+        self.fill_cache.clear();
         Ok(())
     }
 
@@ -820,6 +1156,8 @@ impl ImageSurface {
                     gradient_offsets: Vec::new(),
                     paint: Paint::default(),
                     state_stack: Vec::new(),
+                    fill_cache: FillCache::default(),
+                    text_cache: TextCache::default(),
                 },
             )?;
             Ok(ImageSurface {
