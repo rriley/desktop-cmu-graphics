@@ -737,7 +737,8 @@ class App(object):
         self.runRedrawAll()
 
     def runRedrawAll(self):
-        self.group.clear()
+        # The same as self.group.clear(), without going through slGet/slApply
+        self._tlg._shape.clear()
         shape_logic.startShapeTemplateFrame()
 
         checkerEnabled = not self.disableMvcChecker
@@ -849,18 +850,42 @@ class App(object):
 
         self.callUserFn('onKeyRelease', (key, modifiers))
 
-    def redrawAll(self, ctx):
+    def backgroundShape(self):
+        """The Rect that redrawAll draws the background with. It's in no
+        group and drawing doesn't change it, so the one made for the last
+        frame is drawn again if the app's size, background, and language are
+        the same. It still takes up a shape id, like a new one would."""
+        width, height = self.width, self.height
+        fill = self.background or 'white'
+        try:
+            key = (
+                shape_logic._templateKeyParts((width, height)),
+                # Colors other than names are kept by identity (and kept alive
+                # by the key, so the identity isn't reused)
+                fill if type(fill) is str else (type(fill), id(fill), fill),
+                shape_logic.cmuGraphicsLanguage,
+            )
+        except shape_logic._NotTemplatable:
+            key = None
+        cached = self._backgroundShape
+        if key is not None and cached is not None and cached[0] == key:
+            shape_logic.activeDrawing.nextShapeId += 1
+            return cached[1]
         shape = shape_logic.Rect(
             {
                 'noGroup': True,
                 'top': 0,
                 'left': 0,
-                'width': self.width,
-                'height': self.height,
-                'fill': self.background or 'white',
+                'width': width,
+                'height': height,
+                'fill': fill,
             }
         )
-        shape.draw(ctx)
+        self._backgroundShape = None if key is None else (key, shape)
+        return shape
+
+    def redrawAll(self, ctx):
+        self.backgroundShape().draw(ctx)
 
         ctx.save()
         try:
@@ -963,6 +988,8 @@ class App(object):
         self._frameChanged = True
         self._inspectorWasDrawn = False
         self._errorScreensDrawn = 0
+        # See backgroundShape
+        self._backgroundShape = None
 
     def get_group(self):
         return self._tlg

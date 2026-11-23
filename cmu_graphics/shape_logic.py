@@ -730,11 +730,15 @@ class _ShapeMetaclass(type):
 
 class RGB(object, metaclass=_ShapeMetaclass):
     def __init__(self, red, green, blue):
-        self._attrs = {'class': self.__class__.__name__}
-        self._red = red
-        self._green = green
-        self._blue = blue
-        self._strVal = f'rgb({self._red}, {self._green}, {self._blue})'
+        # What setting each of these with __setattr__ does, without going
+        # through __setattr__ (rgb() is often called many times per frame)
+        fields = self.__dict__
+        fields['_attrs'] = {'class': self.__class__.__name__}
+        for attr, value in (('red', red), ('green', green), ('blue', blue)):
+            if not ((type(value) is int or type(value) is float) and 0 <= value <= 255):
+                checkNumberInRange(self, attr, value, 0, 255, False)
+            fields['_' + attr] = value
+        fields['_strVal'] = f'rgb({red}, {green}, {blue})'
 
     def __getattr__(self, attr):
         en_attr = toEnglish(attr, 'shape-attr')
@@ -1137,10 +1141,12 @@ def addToTopLevelGroup(shape):
     # Same as activeDrawing.tlg.add(shape), which goes through
     # cmu_graphics.Shape.__getattr__ and slGet/slApply to call this
     tlgShape = _topLevelGroupShape()
-    if isinstance(tlgShape, Group):
-        tlgShape.add(shape)
-    else:
+    if not isinstance(tlgShape, Group):
         activeDrawing.tlg.add(shape)
+    elif shape._group is None and shape.oldGroup is None and not shape.isGroup:
+        tlgShape.addNewShape(shape)
+    else:
+        tlgShape.add(shape)
 
 
 # Translated default attribute values, by language then attribute name. Only
@@ -1833,12 +1839,41 @@ def countShapesInGroup(shape):
     return sum(map(countShapesInGroup, shape))
 
 
+def _countShapeAdded():
+    # Every 100 shapes added, check that there aren't too many
+    activeDrawing.addCounter += 1
+    if activeDrawing.addCounter % 100 == 0:
+        if (
+            countShapesInGroup(activeDrawing.tlg)
+            > activeDrawing.appProperties['maxShapeCount']
+        ):
+            pyThrow(
+                t(
+                    'Too many shapes: Your code created more than {{maxShapeCount}} shapes. If you would like to increase this limit even though it may cause your code to run slowly, call app.setMaxShapeCount(n).',
+                    {
+                        'maxShapeCount': str(
+                            activeDrawing.appProperties['maxShapeCount']
+                        )
+                    },
+                )
+            )
+
+
 def checkRecursiveGroupAddition(group, shape):
     if shape.isGroup:
         if group.id == shape.id:
             pyThrow(t('Group.add failed: a Group cannot contain itself.'))
         for subshape in shape._shapes:
             checkRecursiveGroupAddition(group, subshape)
+
+
+def _resetZindexes(group):
+    # The zindex reset at the end of Group.remove, for a group's shapes
+    for shape in group._shapes:
+        if shape.isGroup:
+            _resetZindexes(shape)
+        else:
+            shape.zindex = -1
 
 
 class Group(Shape):
@@ -1890,23 +1925,21 @@ class Group(Shape):
             if not isinstance(shapes[i], Shape):
                 checkShape(t('Group.add(shape)'), t('shape'), shapes[i], True)
             checkRecursiveGroupAddition(self, shapes[i])
-            activeDrawing.addCounter += 1
-            if activeDrawing.addCounter % 100 == 0:
-                if (
-                    countShapesInGroup(activeDrawing.tlg)
-                    > activeDrawing.appProperties['maxShapeCount']
-                ):
-                    pyThrow(
-                        t(
-                            'Too many shapes: Your code created more than {{maxShapeCount}} shapes. If you would like to increase this limit even though it may cause your code to run slowly, call app.setMaxShapeCount(n).',
-                            {
-                                'maxShapeCount': str(
-                                    activeDrawing.appProperties['maxShapeCount']
-                                )
-                            },
-                        )
-                    )
+            _countShapeAdded()
             self.insert(shapes[i])
+
+    def addNewShape(self, shape):
+        """add(shape) for a shape that has never been in a group (and isn't a
+        group): the same checks and changes, without the general case's
+        work."""
+        _countShapeAdded()
+        # What insert() does for a shape with no current or old group
+        self._shapes.append(shape)
+        shape._group = self
+        shape.zindex = -1
+        shape.oldGroup = None
+        shape.shapesToBeInFrontOf = []
+        shape.shapesInOldGroup = {}
 
     def _toFront(self, shape):
         self.remove(shape)
@@ -1917,7 +1950,9 @@ class Group(Shape):
         self.insert(shape, 0)
 
     def remove(self, shape):
-        checkShape(t('Group.remove(shape)'), t('shape'), shape, True)
+        # Only translate the error message names when there's an error
+        if not isinstance(shape, Shape):
+            checkShape(t('Group.remove(shape)'), t('shape'), shape, True)
         currentIndex = self._shapes.index(shape) if shape in self._shapes else -1
         shape.shapesToBeInFrontOf = self._shapes[:currentIndex]
         shape.shapesInOldGroup = {}
@@ -1947,7 +1982,17 @@ class Group(Shape):
         shapes = self._shapes
         self._shapes = []
         for shape in shapes:
-            self.remove(shape)
+            if not isinstance(shape, Shape):
+                self.remove(shape)  # Raises the error
+                continue
+            # What remove(shape) does, now that this group is empty
+            shape.shapesToBeInFrontOf = []
+            shape.shapesInOldGroup = {}
+            shape.oldGroup = self
+            shape._group = None
+            shape.zindex = -1
+            if shape.isGroup:
+                _resetZindexes(shape)
 
     def hits(self, x, y):
         return self.hitTest(x, y) is not None
