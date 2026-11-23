@@ -517,7 +517,186 @@ class NoMvc:
         app._app._isMvc = self.oldMvc
 
 
+# Shapes whose drawing functions can make a shape_logic.LazyShape
+_LAZY_SHAPE_NAMES = frozenset(
+    (
+        'Rect',
+        'Oval',
+        'Circle',
+        'RegularPolygon',
+        'Star',
+        'Polygon',
+        'Line',
+        'Image',
+        'Label',
+    )
+)
+# Keyword arguments that change where a LazyShape's points go. The rest set
+# its style.
+_LAZY_GEOMETRY_KWARGS = frozenset(
+    (
+        'rotateAngle',
+        'align',
+        'lineWidth',
+        'arrowStart',
+        'arrowEnd',
+        'font',
+        'size',
+        'bold',
+        'italic',
+    )
+)
+
+
+def _englishKwargNames(shape, names):
+    """The English names of keyword arguments, as Shape.__init__ translates
+    them, or None if Shape.__init__ would reject one (or two have the same
+    translation)."""
+    result = []
+    for attr in names:
+        enAttr = toEnglish(attr, 'shape-attr')
+        if enAttr not in shape._init_attrs or enAttr in result:
+            return None
+        result.append(enAttr)
+    return tuple(result)
+
+
+def _lazyStyleKey(values):
+    """A key for style keyword argument values: each value with its type, so
+    values that compare equal but behave differently (1, 1.0, and True; 0.0
+    and -0.0) get different keys. An rgb() is keyed by its color, which is
+    all drawing uses. None for other values."""
+    parts = []
+    for value in values:
+        valueType = type(value)
+        if valueType is str:
+            parts.append(value)
+        elif valueType is float:
+            parts.append(value.hex())
+        elif valueType is shape_logic.RGB:
+            fields = value.__dict__
+            red, green, blue = fields['_red'], fields['_green'], fields['_blue']
+            if type(red) is int and type(green) is int and type(blue) is int:
+                # The usual case, without the general case's recursion
+                parts.append((red, green, blue))
+                parts.append(valueType)
+                continue
+            channels = _lazyStyleKey(
+                (
+                    value.__dict__['_red'],
+                    value.__dict__['_green'],
+                    value.__dict__['_blue'],
+                )
+            )
+            if channels is None:
+                return None
+            parts.append(channels)
+        elif valueType in (int, bool, type(None)):
+            parts.append(value)
+        else:
+            return None
+        parts.append(valueType)
+    return tuple(parts)
+
+
+# Caches for _lazyShapePlan. Keyword argument names by the shape, the
+# language, and their names: (English names, the indexes of the geometry
+# ones), or False if they need a real shape (translating them is slow).
+# Styles (checking colors is slow) by those and the style keyword arguments'
+# values: the style, or False for one that needs a real shape.
+_lazyKwargNames = {}
+_lazyShapeStyles = {}
+# Shared by calls without geometry keyword arguments (it's never changed)
+_NO_GEOMETRY = {}
+
+
+def _lazyShapePlan(shape, args, kwargs):
+    namesKey = (shape, shape_logic.cmuGraphicsLanguage, tuple(kwargs))
+    names = _lazyKwargNames.get(namesKey)
+    if names is None:
+        englishNames = _englishKwargNames(shape, namesKey[2])
+        if englishNames is None:
+            names = False
+        else:
+            names = (
+                englishNames,
+                tuple(
+                    i
+                    for i, name in enumerate(englishNames)
+                    if name in _LAZY_GEOMETRY_KWARGS
+                ),
+            )
+        if len(_lazyKwargNames) >= 4096:
+            _lazyKwargNames.clear()
+        _lazyKwargNames[namesKey] = names
+    if names is False:
+        return None
+    englishNames, geometryIndexes = names
+
+    values = tuple(kwargs.values())
+    geometry = _NO_GEOMETRY
+    if geometryIndexes:
+        geometry = {}
+        for i in geometryIndexes:
+            geometry[englishNames[i]] = values[i]
+        values = tuple(v for i, v in enumerate(values) if i not in geometryIndexes)
+    valuesKey = _lazyStyleKey(values)
+    if valuesKey is None:
+        style = None
+    else:
+        styleKey = (namesKey, valuesKey)
+        style = _lazyShapeStyles.get(styleKey)
+    if style is None:
+        styleNames = [
+            name for i, name in enumerate(englishNames) if i not in geometryIndexes
+        ]
+        style = shape_logic.lazyShapeStyle(dict(zip(styleNames, values))) or False
+        if valuesKey is not None:
+            if len(_lazyShapeStyles) >= 4096:
+                _lazyShapeStyles.clear()
+            _lazyShapeStyles[styleKey] = style
+    if style is False:
+        return None
+    return shape_logic.lazyShapePlan(shape.__name__, args, style, geometry)
+
+
+def _makeDrawnShape(shape, args, kwargs, language):
+    """Makes the shape that draw{shape}(*args, **kwargs) would have made, in
+    the language it was called in, for a LazyShape that something needs the
+    real shape for. The new shape isn't added to a group, and doesn't use up
+    an id or count as another shape created: the LazyShape already did."""
+    global SHAPES_CREATED
+    appImpl = app._app
+    drawing = shape_logic.activeDrawing
+    saved = (
+        appImpl._isMvc,
+        shape_logic.cmuGraphicsLanguage,
+        drawing.tlg,
+        drawing.nextShapeId,
+        drawing.addCounter,
+        SHAPES_CREATED,
+    )
+    appImpl._isMvc = False
+    shape_logic.cmuGraphicsLanguage = language
+    drawing.tlg = None
+    try:
+        kwargs = dict(kwargs)
+        kwargs['isMvc'] = True
+        return shape(*args, **kwargs)._shape
+    finally:
+        (
+            appImpl._isMvc,
+            shape_logic.cmuGraphicsLanguage,
+            drawing.tlg,
+            drawing.nextShapeId,
+            drawing.addCounter,
+            SHAPES_CREATED,
+        ) = saved
+
+
 def makeDrawFn(shape):
+    canBeLazy = shape.__name__ in _LAZY_SHAPE_NAMES
+
     def drawFn(*args, **kwargs):
         appImpl = app._app
         if not appImpl._isMvc:
@@ -526,6 +705,16 @@ def makeDrawFn(shape):
             )
         if not appImpl.inRedrawAll:
             raise MvcException('Cannot draw (modify the view) outside of redrawAll')
+        if canBeLazy:
+            plan = _lazyShapePlan(shape, args, kwargs)
+            if plan:
+                global SHAPES_CREATED
+                SHAPES_CREATED += 1
+                language = shape_logic.cmuGraphicsLanguage
+                shape_logic.addLazyShape(
+                    plan, lambda: _makeDrawnShape(shape, args, kwargs, language)
+                )
+                return
         # The same as `with NoMvc():`, which costs more than this, and this
         # runs for every shape drawn
         oldMvc = appImpl._isMvc

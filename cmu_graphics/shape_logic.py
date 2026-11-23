@@ -1836,7 +1836,22 @@ def countShapesInGroup(shape):
         shape = shape._shape
     if not hasattr(shape, '_shapes') or not shape._shapes:
         return 1
-    return sum(map(countShapesInGroup, shape))
+    return _countShapes(shape._shapes)
+
+
+def _countShapes(shapes):
+    # countShapesInGroup for each of a group's shapes, added up. This runs
+    # every 100 shapes added, over every shape, so it checks isGroup rather
+    # than using hasattr (which raises and catches an AttributeError for
+    # every shape that isn't a group). A shape has _shapes once it's a group
+    # (Group.__init__ sets isGroup and _shapes together).
+    total = 0
+    for shape in shapes:
+        if type(shape) is not LazyShape and shape.isGroup and shape._shapes:
+            total += _countShapes(shape._shapes)
+        else:
+            total += 1
+    return total
 
 
 def _countShapeAdded():
@@ -3490,6 +3505,15 @@ class Oval(PolygonWithTransform):
 
     @staticmethod
     def getBezierPoints(startAngle, sweepAngle, isMvc):
+        points = Oval.sharedBezierPoints(startAngle, sweepAngle, isMvc)
+        if points is not None:
+            return [[x, y] for (x, y) in points]
+        return Oval._computeBezierPoints(startAngle, sweepAngle, isMvc)
+
+    @staticmethod
+    def sharedBezierPoints(startAngle, sweepAngle, isMvc):
+        """getBezierPoints, as a tuple of (x, y) tuples shared by every call
+        with the same arguments, or None for arguments it doesn't remember."""
         if type(startAngle) in (int, float) and type(sweepAngle) in (int, float):
             cache = Oval._bezierPointsCache
             key = (
@@ -3509,8 +3533,8 @@ class Oval(PolygonWithTransform):
                         startAngle, sweepAngle, isMvc
                     )
                 )
-            return [[x, y] for (x, y) in points]
-        return Oval._computeBezierPoints(startAngle, sweepAngle, isMvc)
+            return points
+        return None
 
     @staticmethod
     def _computeBezierPoints(startAngle, sweepAngle, isMvc):
@@ -4488,6 +4512,805 @@ class ShapeTemplate(object):
         if activeDrawing.tlg is not None:
             addToTopLevelGroup(shape)
         return shape
+
+
+# In CPCS Mode, most shapes are made by a drawing call, drawn once, and thrown
+# away, without anything else looking at them. So drawRect, drawOval, and
+# drawCircle calls with ordinary arguments make a LazyShape instead of the
+# real shape: a stand-in that joins the group like the real shape would (and
+# takes its id), and draws itself with exactly the canvas calls the real
+# shape's draw() would make. Anything else that looks at it (the inspector,
+# app.group, hit testing...) turns it into the real shape first, made by the
+# same drawing call, so nothing can tell the difference.
+#
+# lazyShapePlan checks the arguments and works out what to draw. It returns
+# None for anything it doesn't handle exactly like the real shape (including
+# any argument the real shape would reject), and the real shape is made as
+# usual.
+
+# Attributes that LazyShape answers itself: the ones groups use to keep
+# track of their shapes, which it sets up like Shape.__init__ does
+_LAZY_FIELDS = frozenset(
+    (
+        '__dict__',
+        '__class__',
+        '_lazy',
+        'draw',
+        'id',
+        '_group',
+        'oldGroup',
+        'shapesToBeInFrontOf',
+        'shapesInOldGroup',
+        'isGroup',
+        'zindex',
+    )
+)
+# Attributes that real shapes that LazyShapes stand in for don't have
+_LAZY_MISSING = frozenset(('_shape', '_shapes'))
+_setObjectClass = object.__dict__['__class__'].__set__
+
+
+class LazyShape(Shape):
+    def __getattribute__(self, attr):
+        if attr in _LAZY_FIELDS:
+            return object.__getattribute__(self, attr)
+        if attr in _LAZY_MISSING:
+            raise AttributeError(attr)
+        materializeLazyShape(self)
+        # Now a real shape
+        return object.__getattribute__(self, attr)
+
+    @property
+    def __class__(self):
+        # So isinstance(lazyCircle, Circle) is True
+        return object.__getattribute__(self, '_lazy')[0]
+
+    def draw(self, ctx):
+        fields = object.__getattribute__(self, '__dict__')
+        cls, drawFn, drawArgs, makeShape = fields['_lazy']
+        drawFn(ctx, *drawArgs)
+        fields['_lazyDrawn'] = True
+
+
+def addLazyShape(plan, makeShape):
+    """Adds a LazyShape for a plan from lazyShapePlan to the top level group.
+    makeShape() makes the real shape (not added to any group)."""
+    cls, drawFn, drawArgs = plan
+    shape = LazyShape.__new__(LazyShape)
+    # What Shape.__init__ sets, in the same order
+    fields = object.__getattribute__(shape, '__dict__')
+    fields['_lazy'] = (cls, drawFn, drawArgs, makeShape)
+    fields['id'] = activeDrawing.nextShapeId
+    activeDrawing.nextShapeId += 1
+    fields['_group'] = fields['oldGroup'] = None
+    fields['shapesToBeInFrontOf'] = []
+    fields['shapesInOldGroup'] = {}
+    fields['isGroup'] = False
+    fields['zindex'] = -1
+    if activeDrawing.tlg is not None:
+        tlgShape = _topLevelGroupShape()
+        if isinstance(tlgShape, Group):
+            tlgShape.addNewShape(shape)
+        else:
+            activeDrawing.tlg.add(shape)
+    return shape
+
+
+def materializeLazyShape(shape):
+    fields = object.__getattribute__(shape, '__dict__')
+    makeShape = fields['_lazy'][3]
+    real = makeShape()
+    if fields.get('_lazyDrawn') and isinstance(real, Label):
+        # What Shape.draw does to a Label it draws
+        if str(real.value) != real.valueStr:
+            real.valueStr = str(real.value)
+            real.setDims()
+    # The real shape's state, except for its place in the group and its id,
+    # which the LazyShape already has
+    newFields = {}
+    for name, value in vars(real).items():
+        if name in _TEMPLATE_GROUP_FIELDS:
+            newFields[name] = fields[name]
+        else:
+            newFields[name] = value
+    fields.clear()
+    fields.update(newFields)
+    _setObjectClass(shape, type(real))
+    # The student's version of the shape (if anything asks for it) refers to
+    # this shape, which is the one in the group
+    studentShape = fields.get('studentShape')
+    if studentShape is not None:
+        studentShape.__dict__['_shape'] = shape
+
+
+_LAZY_SHAPE_KWARGS = frozenset(('fill', 'border', 'borderWidth', 'opacity', 'dashes'))
+_USE_DEFAULT = object()
+
+
+_PLAIN_NUMBER_TYPES = (int, float)
+
+
+def _isPlainNumber(value):
+    # Limited to where sizes of at least _MIN_LAZY_SIZE are always more than
+    # the spacing between floats, so shapes made with them never end up with
+    # a width or height of 0 (which some shapes reject)
+    return (type(value) is int or type(value) is float) and -1e9 <= value <= 1e9
+
+
+_MIN_LAZY_SIZE = 1e-6
+
+
+def _lazyColor(value):
+    # A fill or border that checkColor accepts and the fast path can draw:
+    # None, an RGB, or a color name. Returns False otherwise.
+    if value is None or type(value) is RGB:
+        return True
+    if type(value) is str:
+        return toEnglish(value, 'color').lower() in CSS3_COLORS_TO_RGB
+    return False
+
+
+def _truncated(value):
+    # What shape attribute properties return (see attr_property)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+# (red / 255, green / 255, blue / 255) of color names, by language and name
+_lazyColorNames = {}
+
+
+def _lazyRgba(color, opacity):
+    # Shape.getFillOrStrokeStyle for a color name or an RGB
+    if isinstance(color, str):
+        byName = _lazyColorNames.get(cmuGraphicsLanguage)
+        if byName is None:
+            byName = _lazyColorNames[cmuGraphicsLanguage] = {}
+        rgb = byName.get(color)
+        if rgb is None:
+            rgbColor = CSS3_COLORS_TO_RGB[toEnglish(color, 'color').lower()]
+            if len(byName) >= 4096:
+                byName.clear()
+            rgb = byName[color] = (
+                rgbColor._red / 255,
+                rgbColor._green / 255,
+                rgbColor._blue / 255,
+            )
+        return rgb + (opacity / 100,)
+    return (
+        color._red / 255,
+        color._green / 255,
+        color._blue / 255,
+        opacity / 100,
+    )
+
+
+class LazyStyle(object):
+    """A LazyShape's style keyword arguments: values is (fill, border,
+    borderWidth, opacity, dashes), with _USE_DEFAULT for ones not given.
+    Styles are shared by every drawing call with the same arguments, and
+    remember what they resolve to in each language (see resolved)."""
+
+    __slots__ = ('values', 'byLanguage')
+
+    def __init__(self, values):
+        self.values = values
+        self.byLanguage = {}
+
+    def resolved(self):
+        """(fill, border, borderWidth, opacity, dashes, fill's
+        set_source_rgba arguments, border's), with the values Shape.draw
+        reads (see _lazyStyle). The colors' arguments are None for no
+        color."""
+        resolved = self.byLanguage.get(cmuGraphicsLanguage)
+        if resolved is None:
+            fill, border, borderWidth, opacity, dashes = _lazyStyle(self)
+            resolved = self.byLanguage[cmuGraphicsLanguage] = (
+                fill,
+                border,
+                borderWidth,
+                opacity,
+                dashes,
+                None if fill is None else _lazyRgba(fill, opacity),
+                None if border is None else _lazyRgba(border, opacity),
+            )
+        return resolved
+
+
+def _lazyStyle(style):
+    """The values Shape.draw reads, as it reads them, from a LazyStyle."""
+    fill, border, borderWidth, opacity, dashes = style.values
+    if _USE_DEFAULT in style.values:
+        defaults = _lazyDefaults.get(cmuGraphicsLanguage)
+        if defaults is None:
+            defaults = _lazyDefaults[cmuGraphicsLanguage] = tuple(
+                translatedDefault(shapeAttrDefaults, name)
+                for name in ('fill', 'border', 'borderWidth', 'opacity', 'dashes')
+            )
+        if fill is _USE_DEFAULT:
+            fill = defaults[0]
+        if border is _USE_DEFAULT:
+            border = defaults[1]
+        if borderWidth is _USE_DEFAULT:
+            borderWidth = defaults[2]
+        if opacity is _USE_DEFAULT:
+            opacity = defaults[3]
+        if dashes is _USE_DEFAULT:
+            dashes = defaults[4]
+    return fill, border, _truncated(borderWidth), _truncated(opacity), dashes
+
+
+# Translated defaults of the style attributes, by language
+_lazyDefaults = {}
+
+
+def _lazyFillAndBorder(ctx, style):
+    # The part of Shape.draw after the path is made, for a closed shape with
+    # more than 2 points, that isn't an Arc or an Image
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    bw = borderWidth if border else 0
+    ctx.close_path()
+    if fill:
+        ctx.set_source_rgba(*fillRgba)
+        ctx.fill_preserve()
+    if bw:
+        bw *= 2
+        ctx.clip_preserve()
+        ctx.set_source_rgba(*borderRgba)
+        ctx.set_dash([5, 5] if dashes else [])
+        ctx.set_line_width(bw)
+        ctx.stroke()
+    ctx.restore()
+
+
+def _drawLazyPolygon(ctx, pointList, style):
+    # Shape.draw for a Polygon (utils.makePolygonPath makes the path)
+    ctx.save()
+    ctx.new_path()
+    lastPt = pointList[-1]
+    ctx.move_to(lastPt[0], lastPt[1])
+    for pt in pointList:
+        ctx.line_to(pt[0], pt[1])
+    _lazyFillAndBorder(ctx, style)
+
+
+def _drawLazyOval(ctx, bp, style):
+    # Shape.draw for an Oval, with the points of Oval.makePath
+    ctx.save()
+    ctx.new_path()
+    ctx.move_to(bp[0][0], bp[0][1])
+    for i in range(0, len(bp) // 4):
+        i2 = i * 4
+        ctx.curve_to(
+            bp[i2 + 1][0],
+            bp[i2 + 1][1],
+            bp[i2 + 2][0],
+            bp[i2 + 2][1],
+            bp[i2 + 3][0],
+            bp[i2 + 3][1],
+        )
+    ctx.close_path()
+    _lazyFillAndBorder(ctx, style)
+
+
+def _drawLazyLine(ctx, x1, y1, x2, y2, lineWidth, style):
+    # Shape.draw for a Line without arrows
+    ctx.save()
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    if fill:
+        ctx.new_path()
+        ctx.set_source_rgba(*fillRgba)
+        ctx.set_dash([5, 5] if dashes else [])
+        ctx.set_line_width(lineWidth)
+        ctx.move_to(x1, y1)
+        ctx.line_to(x2, y2)
+        ctx.stroke()
+    ctx.restore()
+
+
+def _lazyKwargsStyle(kwargs):
+    """The style for keyword arguments (already translated to English), or
+    None if they aren't ones the fast path handles exactly."""
+    for name in kwargs:
+        if name not in _LAZY_SHAPE_KWARGS:
+            return None
+    fill = kwargs.get('fill', _USE_DEFAULT)
+    border = kwargs.get('border', _USE_DEFAULT)
+    borderWidth = kwargs.get('borderWidth', _USE_DEFAULT)
+    opacity = kwargs.get('opacity', _USE_DEFAULT)
+    dashes = kwargs.get('dashes', _USE_DEFAULT)
+    if fill is not _USE_DEFAULT and not _lazyColor(fill):
+        return None
+    if border is not _USE_DEFAULT and not _lazyColor(border):
+        return None
+    if borderWidth is not _USE_DEFAULT and not (
+        _isPlainNumber(borderWidth) and borderWidth >= 0
+    ):
+        return None
+    if opacity is not _USE_DEFAULT and not (
+        _isPlainNumber(opacity) and 0 <= opacity <= 100
+    ):
+        return None
+    if dashes is not _USE_DEFAULT and type(dashes) is not bool:
+        return None
+    return LazyStyle((fill, border, borderWidth, opacity, dashes))
+
+
+def lazyShapeStyle(kwargs):
+    """The style for a LazyShape made with these keyword arguments (with
+    English names), or None if they need a real shape. Only depends on the
+    arguments and the language."""
+    return _lazyKwargsStyle(kwargs)
+
+
+def _lazyAlignedPoints(pointList, x, y, align):
+    """Moves pointList (in place) the way Shape.doAlign(x, y, align) moves a
+    Polygon's points: through Polygon's left, right, and centerX (and top,
+    bottom, and centerY) properties, with its centerX and centerY attributes
+    kept up to date as setDims would. (See _lazyAlignedRect.)"""
+    box = utils.getBoxDims(pointList)
+    center = [box['left'] + box['width'] / 2, box['top'] + box['height'] / 2]
+
+    def move(varIndex, d):
+        # Polygon.addxy, then setDims (through the pointList setter)
+        if d == 0:
+            return
+        for point in pointList:
+            point[varIndex] += d
+        box = utils.getBoxDims(pointList)
+        center[0] = box['left'] + box['width'] / 2
+        center[1] = box['top'] + box['height'] / 2
+
+    # Reading the properties truncates integer floats (see shape_property)
+    for varIndex, (attr, v) in enumerate(zip(getAlignAttrs(align), (x, y))):
+        values = [point[varIndex] for point in pointList]
+        if attr in ('left', 'top'):
+            move(varIndex, v - _truncated(utils.min_or_inf(values)))
+        elif attr in ('right', 'bottom'):
+            move(varIndex, v - _truncated(max(values)))
+        else:
+            move(varIndex, v - _truncated(center[varIndex]))
+            center[varIndex] = v
+
+
+def _lazyRotatedMatrix(matrix, degrees):
+    """PolygonWithTransform.doRotate's change to transformMatrix (multMat)."""
+    cos = utils.intCos(-degrees)
+    sin = utils.intSin(-degrees)
+    trans = [[cos, sin], [-sin, cos]]
+    newTrans = [[0, 0], [0, 0]]
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                newTrans[i][j] += matrix[k][j] * trans[i][k]
+    return newTrans
+
+
+def _drawLazyImage(ctx, url, pointList, matrix, opacity):
+    # Shape.draw for an Image (with no fill or border, and not resized), with
+    # CMUImage.drawImage
+    if opacity is _USE_DEFAULT:
+        opacity = translatedDefault(shapeAttrDefaults, 'opacity')
+    opacity = _truncated(opacity)
+    ctx.save()
+    ctx.new_path()
+    lastPt = pointList[-1]
+    ctx.move_to(lastPt[0], lastPt[1])
+    for pt in pointList:
+        ctx.line_to(pt[0], pt[1])
+    ctx.close_path()
+    src = activeDrawing.images[hashReference(url)]
+    x, y = pointList[0][0], pointList[0][1]
+    mat = matrix
+    if mat[0][1] == 0 and mat[1][0] == 0 and mat[0][0] > 0 and mat[1][1] > 0:
+        # Not resized, so drawImage draws the image itself
+        ctx.translate(x, y)
+        ctx.draw_image(src, 0, 0, opacity / 100)
+    else:
+        ctx.translate(x, y)
+        ctx.transform(mat[0][0], mat[1][0], mat[0][1], mat[1][1], 0, 0)
+        ctx.draw_image(src, 0, 0, opacity / 100)
+    ctx.restore()
+
+
+def _lazyImagePlan(args, style, rotateAngle, align):
+    if len(args) != 3:
+        return None
+    url, left, top = args
+    fill, border, borderWidth, opacity, dashes = style.values
+    if not (
+        fill is _USE_DEFAULT
+        and border is _USE_DEFAULT
+        and borderWidth is _USE_DEFAULT
+        and dashes is _USE_DEFAULT
+    ):
+        return None
+    if not (
+        (type(url) is str or type(url) is PILWrapper)
+        and _isPlainNumber(left)
+        and _isPlainNumber(top)
+    ):
+        return None
+    try:
+        # Loads the image like CMUImage.__init__ does (it's cached after the
+        # first time). For a bad url, the real shape raises the error.
+        size = loadImage(url)
+    except Exception:
+        return None
+    # CMUImage.__init__'s points and transform
+    right = left + size['width']
+    bottom = top + size['height']
+    pointList = [[left, top], [right, top], [right, bottom], [left, bottom]]
+    matrix = [[1, 0], [0, 1]]
+    if rotateAngle is not _USE_DEFAULT:
+        degrees = rotateAngle - 0
+        pointList = _lazyRotatedPoints(pointList, degrees)
+        matrix = _lazyRotatedMatrix(matrix, degrees)
+    if align is not _USE_DEFAULT:
+        _lazyAlignedPoints(pointList, left, top, align)
+    for value in (coord for point in pointList for coord in point):
+        if not _isPlainNumber(value):
+            return None
+    return (CMUImage, _drawLazyImage, (url, pointList, matrix, opacity))
+
+
+def _lazyLabelDims(centerX, centerY, stringValue, extents):
+    """Label.setDims for an unrotated label: (approxPoints, xAdjust, width,
+    height)."""
+    xBearing, yBearing, width, height, xAdvance, yAdvance = extents
+    height = -yBearing
+    unrotatedWidth = width
+    hasOuterSpaces = len(stringValue) > 0 and (
+        stringValue[0] == ' ' or stringValue[-1] == ' '
+    )
+    if hasOuterSpaces:
+        unrotatedWidth = max(unrotatedWidth, xAdvance)
+    unrotatedHeight = height
+    x0 = centerX - unrotatedWidth / 2
+    y0 = centerY - unrotatedHeight / 2
+    x1 = centerX + unrotatedWidth / 2
+    y1 = centerY + unrotatedHeight / 2
+    pts = [
+        [x0, y0],
+        [(x0 + x1) / 2, y0],
+        [x1, y0],
+        [x1, (y0 + y1) / 2],
+        [x1, y1],
+        [(x0 + x1) / 2, y1],
+        [x0, y1],
+        [x0, (y0 + y1) / 2],
+    ]
+    box = utils.getBoxDims(pts)
+    return pts, 0 if hasOuterSpaces else xBearing, box['width'], box['height']
+
+
+def _drawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, style):
+    # Shape.draw for an unrotated Label (whose dimensions setDims has already
+    # worked out)
+    ctx.save()
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    if font is _USE_DEFAULT:
+        font = translatedDefault(shapeAttrDefaults, 'font')
+    bw = borderWidth if border else 0
+    targetX, targetY = target
+    ctx.select_font_face(*getFont(font, bold, italic))
+    ctx.set_font_size(size)
+    ctx.new_path()
+    ctx.move_to(targetX - xAdjust, targetY)
+    ctx.text_path(text)
+    # getFillOrStrokeStyle draws a fill of None as black
+    ctx.set_source_rgba(*((0, 0, 0, 1) if fill is None else fillRgba))
+    ctx.fill_preserve()
+    if bw:
+        ctx.set_source_rgba(*borderRgba)
+        ctx.set_line_width(bw)
+        ctx.stroke()
+    ctx.restore()
+
+
+_LAZY_LABEL_VALUE_TYPES = frozenset((str, int, float, bool, type(None)))
+
+
+def _lazyLabelPlan(args, style, geometry):
+    if len(args) != 3 or 'rotateAngle' in geometry:
+        return None
+    value, centerX, centerY = args
+    if not (
+        type(value) in _LAZY_LABEL_VALUE_TYPES
+        and _isPlainNumber(centerX)
+        and _isPlainNumber(centerY)
+    ):
+        return None
+    dashes = style.values[4]
+    if dashes is not _USE_DEFAULT:
+        return None
+    font = geometry.get('font', _USE_DEFAULT)
+    size = geometry.get('size', _USE_DEFAULT)
+    bold = geometry.get('bold', _USE_DEFAULT)
+    italic = geometry.get('italic', _USE_DEFAULT)
+    if font is not _USE_DEFAULT:
+        # Setting a font can print a warning (once), which a LazyShape would skip
+        if type(font) is not str or font.lower() in FONTS_SHOW_WARNING:
+            return None
+    if size is not _USE_DEFAULT and not (_isPlainNumber(size) and size >= 0):
+        return None
+    for flag in (bold, italic):
+        if flag is not _USE_DEFAULT and type(flag) is not bool:
+            return None
+    # The values the Label's properties have
+    fontValue = (
+        translatedDefault(shapeAttrDefaults, 'font') if font is _USE_DEFAULT else font
+    )
+    size = _truncated(
+        translatedDefault(shapeAttrDefaults, 'size') if size is _USE_DEFAULT else size
+    )
+    bold = (
+        translatedDefault(shapeAttrDefaults, 'bold') if bold is _USE_DEFAULT else bold
+    )
+    italic = (
+        translatedDefault(shapeAttrDefaults, 'italic')
+        if italic is _USE_DEFAULT
+        else italic
+    )
+    stringValue = str(_truncated(value))
+    fontCtx.select_font_face(*getFont(fontValue, bold, italic))
+    fontCtx.set_font_size(size)
+    extents = fontCtx.text_extents(stringValue)
+    pts, xAdjust, width, height = _lazyLabelDims(centerX, centerY, stringValue, extents)
+
+    align = geometry.get('align', _USE_DEFAULT)
+    if align is not _USE_DEFAULT:
+        # doAlign(centerX, centerY, align), through Shape's left, right, top,
+        # and bottom properties and Label's centerX and centerY setters (which
+        # call setDims). Properties truncate integer floats.
+        x, y = centerX, centerY
+        xattr, yattr = getAlignAttrs(align)
+        if xattr == 'left':
+            d = x - _truncated(_truncated(centerX) - _truncated(width) / 2)
+            if d != 0:
+                centerX = _truncated(centerX) + d
+                pts, xAdjust, width, height = _lazyLabelDims(
+                    centerX, centerY, stringValue, extents
+                )
+        else:
+            centerX = x - _truncated(width) / 2 if xattr == 'right' else x
+            pts, xAdjust, width, height = _lazyLabelDims(
+                centerX, centerY, stringValue, extents
+            )
+        if yattr == 'top':
+            centerY = y + _truncated(height) / 2
+        elif yattr == 'bottom':
+            centerY = y - _truncated(height) / 2
+        else:
+            centerY = y
+        pts, xAdjust, width, height = _lazyLabelDims(
+            centerX, centerY, stringValue, extents
+        )
+    return (
+        Label,
+        _drawLazyLabel,
+        (stringValue, font, size, bold, italic, pts[6], xAdjust, style),
+    )
+
+
+def _lazyAlignedRect(left, top, right, bottom, x, y, align):
+    """Where Shape.doAlign(x, y, align) moves a Rect's points, [[left, top],
+    [right, top], [right, bottom], [left, bottom]], with left < right and
+    top < bottom (see _isPositiveSize). Returns the new (left, top, right,
+    bottom).
+
+    doAlign sets the Rect's left, right, or centerX property (then top,
+    bottom, or centerY), which moves all of its points by the difference
+    (Polygon.addxy), then updates its centerX and centerY attributes from
+    their bounding box (setDims). The bounding box getBoxDims finds for a
+    Rect's points is left, top, right - left, and bottom - top. Setting
+    centerX also sets the centerX attribute itself."""
+    edges = [left, right, top, bottom]  # low x, high x, low y, high y
+    center = [left + (right - left) / 2, top + (bottom - top) / 2]
+    for varIndex, (attr, v) in enumerate(zip(getAlignAttrs(align), (x, y))):
+        low, high = edges[2 * varIndex], edges[2 * varIndex + 1]
+        if attr in ('left', 'top'):
+            d = v - _truncated(low)
+        elif attr in ('right', 'bottom'):
+            d = v - _truncated(high)
+        else:
+            d = v - _truncated(center[varIndex])
+        if d != 0:
+            # Polygon.addxy, then setDims
+            edges[2 * varIndex] = low + d
+            edges[2 * varIndex + 1] = high + d
+            center[0] = edges[0] + (edges[1] - edges[0]) / 2
+            center[1] = edges[2] + (edges[3] - edges[2]) / 2
+        if attr not in ('left', 'top', 'right', 'bottom'):
+            center[varIndex] = v
+    return edges[0], edges[2], edges[1], edges[3]
+
+
+def _lazyRotatedPoints(pointList, degrees):
+    """The points after Shape._rotate(degrees) for a Polygon with these
+    points and no rotation yet: around its centroid, rounded by round6."""
+    cx, cy = utils.getPolygonCentroid(pointList)
+    return utils.rotatePoints(pointList, degrees, utils.round6(cx), utils.round6(cy))
+
+
+def _isPositiveSize(value):
+    return _isPlainNumber(value) and value >= _MIN_LAZY_SIZE
+
+
+def lazyShapePlan(clsName, args, style, geometry):
+    """For a drawing call a LazyShape can stand in for, returns
+    (shape class, draw function, draw arguments). Otherwise None.
+
+    style comes from lazyShapeStyle. geometry has the call's rotateAngle and
+    align keyword arguments (with English names), if it had any."""
+    if not geometry:
+        # The most common calls, with the checks inlined
+        if clsName == 'Rect' and len(args) == 4:
+            left, top, width, height = args
+            if (
+                type(left) in _PLAIN_NUMBER_TYPES
+                and type(top) in _PLAIN_NUMBER_TYPES
+                and type(width) in _PLAIN_NUMBER_TYPES
+                and type(height) in _PLAIN_NUMBER_TYPES
+                and -1e9 <= left <= 1e9
+                and -1e9 <= top <= 1e9
+                and _MIN_LAZY_SIZE <= width <= 1e9
+                and _MIN_LAZY_SIZE <= height <= 1e9
+            ):
+                right = left + width
+                bottom = top + height
+                pointList = [
+                    [left, top],
+                    [right, top],
+                    [right, bottom],
+                    [left, bottom],
+                ]
+                return (Rect, _drawLazyPolygon, (pointList, style))
+            return None
+        rotateAngle = align = _USE_DEFAULT
+    else:
+        rotateAngle = geometry.get('rotateAngle', _USE_DEFAULT)
+        align = geometry.get('align', _USE_DEFAULT)
+        if rotateAngle is not _USE_DEFAULT and not _isPlainNumber(rotateAngle):
+            return None
+        if align is not _USE_DEFAULT:
+            if type(align) is not str:
+                return None
+            align = toEnglish(align, 'align')
+            if align not in aligns:
+                return None
+
+    if clsName == 'Image':
+        return _lazyImagePlan(args, style, rotateAngle, align)
+    if clsName == 'Label':
+        if align is not _USE_DEFAULT:
+            geometry = dict(geometry, align=align)
+        return _lazyLabelPlan(args, style, geometry)
+
+    if clsName == 'Rect':
+        if len(args) != 4 or rotateAngle is not _USE_DEFAULT:
+            return None
+        left, top, width, height = args
+        if not (
+            _isPlainNumber(left)
+            and _isPlainNumber(top)
+            and _isPositiveSize(width)
+            and _isPositiveSize(height)
+        ):
+            return None
+        # Rect.__init__'s points
+        right = left + width
+        bottom = top + height
+        if align is not _USE_DEFAULT:
+            left, top, right, bottom = _lazyAlignedRect(
+                left, top, right, bottom, args[0], args[1], align
+            )
+        pointList = [[left, top], [right, top], [right, bottom], [left, bottom]]
+        return (Rect, _drawLazyPolygon, (pointList, style))
+
+    if clsName in ('Circle', 'Oval'):
+        if rotateAngle is not _USE_DEFAULT or align is not _USE_DEFAULT:
+            return None
+        if clsName == 'Circle':
+            if len(args) != 3:
+                return None
+            centerX, centerY, radius = args
+            if not (
+                _isPlainNumber(centerX)
+                and _isPlainNumber(centerY)
+                and _isPositiveSize(radius)
+            ):
+                return None
+            # Circle.__init__
+            width = height = 2 * radius
+            cls = Circle
+        else:
+            if len(args) != 4:
+                return None
+            centerX, centerY, width, height = args
+            if not (
+                _isPlainNumber(centerX)
+                and _isPlainNumber(centerY)
+                and _isPositiveSize(width)
+                and _isPositiveSize(height)
+            ):
+                return None
+            cls = Oval
+        # Oval.__init__'s transform, and Oval.makePath's points
+        m00, m01, m10, m11 = width / 2, 0, 0, height / 2
+        bp = [
+            [m00 * px + m01 * py + centerX, m10 * px + m11 * py + centerY]
+            for px, py in Oval.sharedBezierPoints(0, 360, True)
+        ]
+        return (cls, _drawLazyOval, (bp, style))
+
+    if clsName == 'Line':
+        lineWidth = geometry.get('lineWidth', _USE_DEFAULT)
+        if (
+            len(args) != 4
+            or rotateAngle is not _USE_DEFAULT
+            or align is not _USE_DEFAULT
+            or geometry.get('arrowStart', False) is not False
+            or geometry.get('arrowEnd', False) is not False
+            or (lineWidth is not _USE_DEFAULT and not _isPositiveSize(lineWidth))
+        ):
+            return None
+        x1, y1, x2, y2 = args
+        if not (
+            _isPlainNumber(x1)
+            and _isPlainNumber(y1)
+            and _isPlainNumber(x2)
+            and _isPlainNumber(y2)
+        ):
+            return None
+        # Line's x1, y1, x2, and y2 properties return the arguments (from
+        # exactValues), truncated. Its lineWidth property is the distance
+        # across the points around the line, which Line.__init__ makes 2
+        # wide, and setting lineWidth remakes from the properties.
+        x1, y1, x2, y2 = (_truncated(v) for v in args)
+        if lineWidth is _USE_DEFAULT:
+            pts = utils.getLinePoints(args[0], args[1], args[2], args[3], 2)
+        else:
+            pts = utils.getLinePoints(x1, y1, x2, y2, lineWidth)
+        width = _truncated(utils.distance(pts[0][0], pts[0][1], pts[3][0], pts[3][1]))
+        return (Line, _drawLazyLine, (x1, y1, x2, y2, width, style))
+
+    if align is not _USE_DEFAULT:
+        return None
+    if clsName in ('RegularPolygon', 'Star'):
+        if len(args) != 4:
+            return None
+        centerX, centerY, radius, points = args
+        if not (
+            _isPlainNumber(centerX)
+            and _isPlainNumber(centerY)
+            and _isPositiveSize(radius)
+            and type(points) is int
+            and points >= 3
+        ):
+            return None
+        if clsName == 'RegularPolygon':
+            pts = utils.getRegularPolygonPoints(centerX, centerY, radius, points, 0)
+            cls = RegularPolygon
+        else:
+            pts = utils.getStarPoints(centerX, centerY, radius, points, None, 0)
+            cls = Star
+    elif clsName == 'Polygon':
+        # drawPolygon's arguments are the points' coordinates
+        if len(args) < 6 or len(args) % 2 != 0:
+            return None
+        for value in args:
+            if not _isPlainNumber(value):
+                return None
+        pts = [[args[i], args[i + 1]] for i in range(0, len(args), 2)]
+        cls = Polygon
+    else:
+        return None
+    if rotateAngle is not _USE_DEFAULT:
+        # Setting rotateAngle rotates the points from 0 (even to 0)
+        pts = _lazyRotatedPoints(pts, rotateAngle - 0)
+    return (cls, _drawLazyPolygon, (pts, style))
 
 
 class ShapeLogicInterface(object):
