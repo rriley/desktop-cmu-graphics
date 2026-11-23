@@ -1737,8 +1737,11 @@ def save_update_info(update_info):
 
 def version_key(version):
     # Compare release numbers numerically, so that 2.0.10 is newer than 2.0.9.
-    # Raises ValueError for anything that isn't a plain X.Y.Z version.
-    return tuple(int(part) for part in version.split('.'))
+    # A -N suffix (a post-release, like 3.0.2-1) comes after X.Y.Z and before
+    # the next release. Raises ValueError for anything else.
+    release, _, post = version.partition('-')
+    key = tuple(int(part) for part in release.split('.'))
+    return key + (int(post),) if post else key
 
 
 def check_for_update():
