@@ -783,17 +783,22 @@ class RGB(object, metaclass=_ShapeMetaclass):
     def __repr__(self):
         return self._strVal
 
+    # red, green, and blue are __dict__['_red'] and so on (see __getattr__),
+    # read directly since colors are hashed and compared often
     def __eq__(self, other):
         if not isinstance(other, RGB):
             return False
+        fields = self.__dict__
+        otherFields = other.__dict__
         return (
-            self.red == other.red
-            and self.green == other.green
-            and self.blue == other.blue
+            fields['_red'] == otherFields['_red']
+            and fields['_green'] == otherFields['_green']
+            and fields['_blue'] == otherFields['_blue']
         )
 
     def __hash__(self):
-        return hash((self.red, self.green, self.blue))
+        fields = self.__dict__
+        return hash((fields['_red'], fields['_green'], fields['_blue']))
 
 
 RGB.__name__ = 'rgb'
@@ -1834,6 +1839,14 @@ def countShapesInGroup(shape):
     # First make it a sl shape so hasattr doesn't call getattr and crash
     if hasattr(shape, '_shape'):
         shape = shape._shape
+    if type(shape) is TopLevelGroup:
+        # Counts its records without making them into shapes
+        fields = shape.__dict__
+        ownShapes = fields['_ownShapes']
+        pendingCount = len(fields['_pending'])
+        if not ownShapes and not pendingCount:
+            return 1
+        return _countShapes(ownShapes) + pendingCount
     if not hasattr(shape, '_shapes') or not shape._shapes:
         return 1
     return _countShapes(shape._shapes)
@@ -4623,6 +4636,163 @@ def materializeLazyShape(shape):
         studentShape.__dict__['_shape'] = shape
 
 
+# Set by cmu_graphics: makeDrawnShape(shape, args, kwargs, language) makes the
+# real shape for a drawing call (see cmu_graphics._makeDrawnShape)
+makeDrawnShape = None
+
+
+class TopLevelGroup(Group):
+    """The app's group (the one drawing calls add shapes to).
+
+    A CPCS Mode drawing call that a LazyShape can stand in for doesn't make
+    the LazyShape right away. It adds a record of the call to _pending (see
+    addPendingShape), which is all that drawing and clearing the group need:
+    nearly every frame, the group is cleared, the records are drawn, and
+    nothing else looks at them. Anything else that looks at the group's
+    shapes (through _shapes) first turns the records into the LazyShapes
+    they stand for, in order, after the shapes already in the group, as if
+    each had been added when its drawing call was made.
+
+    The group's own list of shapes is _ownShapes, which _shapes returns."""
+
+    @property
+    def _shapes(self):
+        fields = self.__dict__
+        if fields['_pending']:
+            self._addPendingShapes()
+        return fields['_ownShapes']
+
+    @_shapes.setter
+    def _shapes(self, value):
+        fields = self.__dict__
+        if fields.get('_pending'):
+            self._addPendingShapes()
+        fields['_ownShapes'] = value
+
+    def _addPendingShapes(self):
+        fields = self.__dict__
+        pending = fields['_pending']
+        drawnCount = fields['_pendingDrawn']
+        fields['_pending'] = []
+        fields['_pendingDrawn'] = 0
+        ownShapes = fields['_ownShapes']
+        for index, record in enumerate(pending):
+            if record[0] is None:
+                # A real shape (see addNewShape)
+                ownShapes.append(record[1])
+                continue
+            drawFn, drawArgs, cls, shapeId, makeArgs = record
+            shape = LazyShape.__new__(LazyShape)
+            # What addLazyShape and then addNewShape set
+            shapeFields = object.__getattribute__(shape, '__dict__')
+            shapeFields['_lazy'] = (
+                cls,
+                drawFn,
+                drawArgs,
+                lambda makeArgs=makeArgs: makeDrawnShape(*makeArgs),
+            )
+            shapeFields['id'] = shapeId
+            shapeFields['_group'] = self
+            shapeFields['oldGroup'] = None
+            shapeFields['shapesToBeInFrontOf'] = []
+            shapeFields['shapesInOldGroup'] = {}
+            shapeFields['isGroup'] = False
+            shapeFields['zindex'] = -1
+            if index < drawnCount:
+                shapeFields['_lazyDrawn'] = True
+            ownShapes.append(shape)
+
+    def addNewShape(self, shape):
+        fields = self.__dict__
+        pending = fields['_pending']
+        if not pending:
+            Group.addNewShape(self, shape)
+            return
+        # A real shape drawn after records (like a rotated Label in CPCS
+        # Mode) goes after them as a record of its own, (None, shape), so
+        # the records don't all have to become LazyShapes. Otherwise this
+        # is the same as Group.addNewShape.
+        _countShapeAdded()
+        pending.append((None, shape))
+        shape._group = self
+        shape.zindex = -1
+        shape.oldGroup = None
+        shape.shapesToBeInFrontOf = []
+        shape.shapesInOldGroup = {}
+
+    def clear(self):
+        # Nothing but this group knows about the records, so dropping them is
+        # all that clearing would do to the LazyShapes they stand for
+        fields = self.__dict__
+        fields['_pending'] = []
+        fields['_pendingDrawn'] = 0
+        Group.clear(self)
+
+    def draw(self, ctx):
+        fields = self.__dict__
+        pending = fields['_pending']
+        if not pending or self.db != '':
+            Shape.draw(self, ctx)
+            return
+        # Shape.draw for a group (without a db), with each record drawn the
+        # way its LazyShape would draw itself
+        ctx.save()
+        for s in fields['_ownShapes']:
+            s.draw(ctx)
+        drawers = _FAST_DRAWERS if type(ctx) is _CANVAS_TYPE else None
+        if drawers:
+            get = drawers.get
+            for record in pending:
+                drawFn = record[0]
+                if drawFn is None:
+                    record[1].draw(ctx)
+                else:
+                    get(drawFn, drawFn)(ctx, *record[1])
+        else:
+            for record in pending:
+                if record[0] is None:
+                    record[1].draw(ctx)
+                else:
+                    record[0](ctx, *record[1])
+        fields['_pendingDrawn'] = len(pending)
+        ctx.restore()
+
+
+def makeTopLevelGroup(group):
+    """Makes a new, empty Group into a TopLevelGroup."""
+    fields = group.__dict__
+    fields['_ownShapes'] = fields.pop('_shapes')
+    fields['_pending'] = []
+    fields['_pendingDrawn'] = 0
+    _setObjectClass(group, TopLevelGroup)
+
+
+def addPendingShape(plan, makeArgs):
+    """Adds a LazyShape for a plan from lazyShapePlan to the top level group,
+    as a record if it's a TopLevelGroup (see TopLevelGroup). makeArgs are
+    makeDrawnShape's arguments, for making the real shape."""
+    tlg = activeDrawing.tlg
+    tlgShape = getattr(tlg, '_shape', tlg)
+    if type(tlgShape) is not TopLevelGroup:
+        return addLazyShape(plan, lambda: makeDrawnShape(*makeArgs))
+    drawing = activeDrawing
+    shapeId = drawing.nextShapeId
+    drawing.nextShapeId = shapeId + 1
+    # _countShapeAdded, with the check every 100 shapes inlined
+    count = drawing.addCounter + 1
+    drawing.addCounter = count
+    if count % 100 == 0:
+        drawing.addCounter = count - 1
+        _countShapeAdded()
+    tlgShape.__dict__['_pending'].append((plan[1], plan[2], plan[0], shapeId, makeArgs))
+
+
+# Faster versions of LazyShape draw functions, by the draw function, for
+# drawing on a wyvern Canvas (see TopLevelGroup.draw). Filled in below.
+_FAST_DRAWERS = {}
+_CANVAS_TYPE = wyvern.Canvas
+
+
 _LAZY_SHAPE_KWARGS = frozenset(('fill', 'border', 'borderWidth', 'opacity', 'dashes'))
 _USE_DEFAULT = object()
 
@@ -4700,20 +4870,32 @@ class LazyStyle(object):
 
     def resolved(self):
         """(fill, border, borderWidth, opacity, dashes, fill's
-        set_source_rgba arguments, border's), with the values Shape.draw
-        reads (see _lazyStyle). The colors' arguments are None for no
-        color."""
+        set_source_rgba arguments, border's, closed shape arguments), with
+        the values Shape.draw reads (see _lazyStyle). The colors' arguments
+        are None for no color. The closed shape arguments are the fill,
+        border, border_width, and dashed arguments of
+        Canvas.draw_closed_shape for drawing a closed shape the way
+        _lazyFillAndBorder does."""
         resolved = self.byLanguage.get(cmuGraphicsLanguage)
         if resolved is None:
             fill, border, borderWidth, opacity, dashes = _lazyStyle(self)
+            fillRgba = None if fill is None else _lazyRgba(fill, opacity)
+            borderRgba = None if border is None else _lazyRgba(border, opacity)
+            bw = borderWidth if border else 0
             resolved = self.byLanguage[cmuGraphicsLanguage] = (
                 fill,
                 border,
                 borderWidth,
                 opacity,
                 dashes,
-                None if fill is None else _lazyRgba(fill, opacity),
-                None if border is None else _lazyRgba(border, opacity),
+                fillRgba,
+                borderRgba,
+                (
+                    fillRgba if fill else None,
+                    borderRgba if bw else None,
+                    bw * 2 if bw else 0,
+                    bool(dashes),
+                ),
             )
         return resolved
 
@@ -4748,7 +4930,9 @@ _lazyDefaults = {}
 def _lazyFillAndBorder(ctx, style):
     # The part of Shape.draw after the path is made, for a closed shape with
     # more than 2 points, that isn't an Arc or an Image
-    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba, _ = (
+        style.resolved()
+    )
     bw = borderWidth if border else 0
     ctx.close_path()
     if fill:
@@ -4764,40 +4948,55 @@ def _lazyFillAndBorder(ctx, style):
     ctx.restore()
 
 
-def _drawLazyPolygon(ctx, pointList, style):
-    # Shape.draw for a Polygon (utils.makePolygonPath makes the path)
+def _drawLazyFlatPolygon(ctx, coords, style):
+    # Shape.draw for a Polygon (utils.makePolygonPath makes the path), with
+    # the points' x and y in one flat sequence
     ctx.save()
     ctx.new_path()
-    lastPt = pointList[-1]
-    ctx.move_to(lastPt[0], lastPt[1])
-    for pt in pointList:
-        ctx.line_to(pt[0], pt[1])
+    ctx.move_to(coords[-2], coords[-1])
+    for i in range(0, len(coords), 2):
+        ctx.line_to(coords[i], coords[i + 1])
     _lazyFillAndBorder(ctx, style)
 
 
-def _drawLazyOval(ctx, bp, style):
-    # Shape.draw for an Oval, with the points of Oval.makePath
+def _drawLazyFlatOval(ctx, coords, style):
+    # Shape.draw for an Oval, with the points of Oval.makePath (their x and y
+    # in one flat sequence)
     ctx.save()
     ctx.new_path()
-    ctx.move_to(bp[0][0], bp[0][1])
-    for i in range(0, len(bp) // 4):
-        i2 = i * 4
+    ctx.move_to(coords[0], coords[1])
+    for i in range(0, len(coords) // 8):
+        i2 = i * 8
         ctx.curve_to(
-            bp[i2 + 1][0],
-            bp[i2 + 1][1],
-            bp[i2 + 2][0],
-            bp[i2 + 2][1],
-            bp[i2 + 3][0],
-            bp[i2 + 3][1],
+            coords[i2 + 2],
+            coords[i2 + 3],
+            coords[i2 + 4],
+            coords[i2 + 5],
+            coords[i2 + 6],
+            coords[i2 + 7],
         )
     ctx.close_path()
     _lazyFillAndBorder(ctx, style)
 
 
+def _fastDrawLazyFlatPolygon(ctx, coords, style):
+    # _drawLazyFlatPolygon with one Canvas call
+    fill, border, bw, dashed = style.resolved()[7]
+    ctx.draw_closed_shape(0, coords, fill, border, bw, dashed)
+
+
+def _fastDrawLazyFlatOval(ctx, coords, style):
+    # _drawLazyFlatOval with one Canvas call
+    fill, border, bw, dashed = style.resolved()[7]
+    ctx.draw_closed_shape(1, coords, fill, border, bw, dashed)
+
+
 def _drawLazyLine(ctx, x1, y1, x2, y2, lineWidth, style):
     # Shape.draw for a Line without arrows
     ctx.save()
-    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba, _ = (
+        style.resolved()
+    )
     if fill:
         ctx.new_path()
         ctx.set_source_rgba(*fillRgba)
@@ -4989,7 +5188,9 @@ def _drawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, style):
     # Shape.draw for an unrotated Label (whose dimensions setDims has already
     # worked out)
     ctx.save()
-    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba = style.resolved()
+    fill, border, borderWidth, opacity, dashes, fillRgba, borderRgba, _ = (
+        style.resolved()
+    )
     if font is _USE_DEFAULT:
         font = translatedDefault(shapeAttrDefaults, 'font')
     bw = borderWidth if border else 0
@@ -5009,12 +5210,81 @@ def _drawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, style):
     ctx.restore()
 
 
+def _fastDrawLazyLabel(ctx, text, font, size, bold, italic, target, xAdjust, style):
+    # _drawLazyLabel with one Canvas call
+    resolved = style.resolved()
+    fill, border, borderWidth = resolved[0], resolved[1], resolved[2]
+    if font is _USE_DEFAULT:
+        font = translatedDefault(shapeAttrDefaults, 'font')
+    bw = borderWidth if border else 0
+    family, weight, slant = getFont(font, bold, italic)
+    ctx.draw_text(
+        text,
+        target[0] - xAdjust,
+        target[1],
+        family,
+        weight,
+        slant,
+        size,
+        # getFillOrStrokeStyle draws a fill of None as black
+        (0, 0, 0, 1) if fill is None else resolved[5],
+        resolved[6] if bw else None,
+        bw,
+    )
+
+
+if hasattr(wyvern.Canvas, 'draw_closed_shape') and hasattr(wyvern.Canvas, 'draw_text'):
+    _FAST_DRAWERS[_drawLazyFlatPolygon] = _fastDrawLazyFlatPolygon
+    _FAST_DRAWERS[_drawLazyFlatOval] = _fastDrawLazyFlatOval
+
+
 _LAZY_LABEL_VALUE_TYPES = frozenset((str, int, float, bool, type(None)))
 
 
+# Label plans by their arguments (see _lazyLabelPlan)
+_lazyLabelPlans = {}
+_LABEL_KEY_TYPES = frozenset((str, int, float, bool, type(None)))
+
+
 def _lazyLabelPlan(args, style, geometry):
+    """Labels are slow to plan (measuring the text, then working out where
+    it goes), and usually drawn with the same arguments frame after frame,
+    so their plans are remembered. A plan only depends on the arguments, the
+    style, the geometry keyword arguments (with their types, since 1, 1.0,
+    and True are equal but can make different plans) and the language. Calls
+    with an argument equal to 0 aren't remembered, since 0.0 and -0.0 are
+    equal (and have the same type) but can make plans with different
+    points."""
     if len(args) != 3 or 'rotateAngle' in geometry:
         return None
+    key = None
+    argTypes = tuple(map(type, args))
+    geometryTypes = tuple(map(type, geometry.values()))
+    # Only keyed by values that hashing and comparing can't run student code
+    # for (anything else can't be planned anyway)
+    if _LABEL_KEY_TYPES.issuperset(argTypes) and _LABEL_KEY_TYPES.issuperset(
+        geometryTypes
+    ):
+        key = (
+            args,
+            argTypes,
+            style,
+            tuple(geometry.items()),
+            geometryTypes,
+            cmuGraphicsLanguage,
+        )
+        plan = _lazyLabelPlans.get(key)
+        if plan is not None:
+            return plan
+    plan = _makeLazyLabelPlan(args, style, geometry)
+    if plan is not None and key is not None and 0 not in args:
+        if len(_lazyLabelPlans) >= 1024:
+            _lazyLabelPlans.clear()
+        _lazyLabelPlans[key] = plan
+    return plan
+
+
+def _makeLazyLabelPlan(args, style, geometry):
     value, centerX, centerY = args
     if not (
         type(value) in _LAZY_LABEL_VALUE_TYPES
@@ -5094,6 +5364,10 @@ def _lazyLabelPlan(args, style, geometry):
     )
 
 
+if _FAST_DRAWERS:
+    _FAST_DRAWERS[_drawLazyLabel] = _fastDrawLazyLabel
+
+
 def _lazyAlignedRect(left, top, right, bottom, x, y, align):
     """Where Shape.doAlign(x, y, align) moves a Rect's points, [[left, top],
     [right, top], [right, bottom], [left, bottom]], with left < right and
@@ -5160,13 +5434,11 @@ def lazyShapePlan(clsName, args, style, geometry):
             ):
                 right = left + width
                 bottom = top + height
-                pointList = [
-                    [left, top],
-                    [right, top],
-                    [right, bottom],
-                    [left, bottom],
-                ]
-                return (Rect, _drawLazyPolygon, (pointList, style))
+                # Rect.__init__'s points
+                coords = (left, top, right, top, right, bottom, left, bottom)
+                return (Rect, _drawLazyFlatPolygon, (coords, style))
+            if clsName == 'Polygon':
+                return _lazyPolygonPlan(args, style, _USE_DEFAULT)
             return None
         rotateAngle = align = _USE_DEFAULT
     else:
@@ -5206,8 +5478,8 @@ def lazyShapePlan(clsName, args, style, geometry):
             left, top, right, bottom = _lazyAlignedRect(
                 left, top, right, bottom, args[0], args[1], align
             )
-        pointList = [[left, top], [right, top], [right, bottom], [left, bottom]]
-        return (Rect, _drawLazyPolygon, (pointList, style))
+        coords = (left, top, right, top, right, bottom, left, bottom)
+        return (Rect, _drawLazyFlatPolygon, (coords, style))
 
     if clsName in ('Circle', 'Oval'):
         if rotateAngle is not _USE_DEFAULT or align is not _USE_DEFAULT:
@@ -5239,11 +5511,11 @@ def lazyShapePlan(clsName, args, style, geometry):
             cls = Oval
         # Oval.__init__'s transform, and Oval.makePath's points
         m00, m01, m10, m11 = width / 2, 0, 0, height / 2
-        bp = [
-            [m00 * px + m01 * py + centerX, m10 * px + m11 * py + centerY]
-            for px, py in Oval.sharedBezierPoints(0, 360, True)
-        ]
-        return (cls, _drawLazyOval, (bp, style))
+        coords = []
+        for px, py in Oval.sharedBezierPoints(0, 360, True):
+            coords.append(m00 * px + m01 * py + centerX)
+            coords.append(m10 * px + m11 * py + centerY)
+        return (cls, _drawLazyFlatOval, (coords, style))
 
     if clsName == 'Line':
         lineWidth = geometry.get('lineWidth', _USE_DEFAULT)
@@ -5297,20 +5569,72 @@ def lazyShapePlan(clsName, args, style, geometry):
             pts = utils.getStarPoints(centerX, centerY, radius, points, None, 0)
             cls = Star
     elif clsName == 'Polygon':
-        # drawPolygon's arguments are the points' coordinates
-        if len(args) < 6 or len(args) % 2 != 0:
-            return None
-        for value in args:
-            if not _isPlainNumber(value):
-                return None
-        pts = [[args[i], args[i + 1]] for i in range(0, len(args), 2)]
-        cls = Polygon
+        return _lazyPolygonPlan(args, style, rotateAngle)
     else:
         return None
     if rotateAngle is not _USE_DEFAULT:
         # Setting rotateAngle rotates the points from 0 (even to 0)
         pts = _lazyRotatedPoints(pts, rotateAngle - 0)
-    return (cls, _drawLazyPolygon, (pts, style))
+    return (cls, _drawLazyFlatPolygon, ([v for pt in pts for v in pt], style))
+
+
+_PLAIN_NUMBER_TYPE_SET = frozenset(_PLAIN_NUMBER_TYPES)
+
+
+def _pyPlainNumbers(values):
+    """Whether every value in the tuple _isPlainNumber: all ints and floats,
+    none less than -1e9 or more than 1e9, and no NaN (which min and max can
+    skip, but which makes the sum NaN; the sum of numbers in that range can't
+    overflow)."""
+    if not (
+        _PLAIN_NUMBER_TYPE_SET.issuperset(map(type, values))
+        and (not values or (-1e9 <= min(values) and max(values) <= 1e9))
+    ):
+        return False
+    total = sum(values)
+    return total == total
+
+
+# wyvern.plain_numbers is the same check, in one call
+_plainNumbers = getattr(wyvern, 'plain_numbers', _pyPlainNumbers)
+
+
+def _lazyRectPlan(args, style):
+    # lazyShapePlan for a Rect without geometry keyword arguments
+    if len(args) != 4 or not _plainNumbers(args):
+        return None
+    left, top, width, height = args
+    if not (width >= _MIN_LAZY_SIZE and height >= _MIN_LAZY_SIZE):
+        return None
+    right = left + width
+    bottom = top + height
+    # Rect.__init__'s points
+    coords = (left, top, right, top, right, bottom, left, bottom)
+    return (Rect, _drawLazyFlatPolygon, (coords, style))
+
+
+def lazyPlanner(clsName):
+    """A function (args, style) that does lazyShapePlan(clsName, args,
+    style, {}), for drawing calls without geometry keyword arguments."""
+    if clsName == 'Rect':
+        return _lazyRectPlan
+    if clsName == 'Polygon':
+        return lambda args, style: _lazyPolygonPlan(args, style, _USE_DEFAULT)
+    return lambda args, style: lazyShapePlan(clsName, args, style, {})
+
+
+def _lazyPolygonPlan(args, style, rotateAngle):
+    # drawPolygon's arguments are the points' coordinates
+    if len(args) < 6 or len(args) % 2 != 0:
+        return None
+    if not _plainNumbers(args):
+        return None
+    if rotateAngle is _USE_DEFAULT:
+        return (Polygon, _drawLazyFlatPolygon, (args, style))
+    pts = [[args[i], args[i + 1]] for i in range(0, len(args), 2)]
+    # Setting rotateAngle rotates the points from 0 (even to 0)
+    pts = _lazyRotatedPoints(pts, rotateAngle - 0)
+    return (Polygon, _drawLazyFlatPolygon, ([v for pt in pts for v in pt], style))
 
 
 class ShapeLogicInterface(object):

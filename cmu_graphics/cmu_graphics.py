@@ -599,6 +599,14 @@ def _lazyStyleKey(values):
     return tuple(parts)
 
 
+# Types of style keyword argument values that can be keyed by the values
+# themselves (with their types), instead of by _lazyStyleKey: hashing and
+# comparing them can't run student code, and equal values of the same type
+# make the same style. (A float and its negative zero, and rgb()s with equal
+# int and float channels, compare equal, and resolve to the same colors and
+# truncated numbers.)
+_PLAIN_STYLE_TYPES = frozenset((str, int, float, bool, type(None), shape_logic.RGB))
+
 # Caches for _lazyShapePlan. Keyword argument names by the shape, the
 # language, and their names: (English names, the indexes of the geometry
 # ones), or False if they need a real shape (translating them is slow).
@@ -610,54 +618,135 @@ _lazyShapeStyles = {}
 _NO_GEOMETRY = {}
 
 
+def _lazyKwargNamesFor(namesKey):
+    shape = namesKey[0]
+    englishNames = _englishKwargNames(shape, namesKey[2])
+    if englishNames is None:
+        names = False
+    else:
+        names = (
+            englishNames,
+            tuple(
+                i
+                for i, name in enumerate(englishNames)
+                if name in _LAZY_GEOMETRY_KWARGS
+            ),
+        )
+    if len(_lazyKwargNames) >= 4096:
+        _lazyKwargNames.clear()
+    _lazyKwargNames[namesKey] = names
+    return names
+
+
+# Styles of calls without geometry keyword arguments (most calls), by the
+# shape, the language, and the keyword arguments' names, values, and the
+# values' types: one lookup instead of _lazyKwargNames' and
+# _lazyShapeStyles'. False for calls that need a real shape.
+_lazyCallStyles = {}
+
+
+# shape_logic.lazyPlanner for each shape a LazyShape can stand in for
+_lazyPlanners = {}
+
+
+# Plans of drawing calls of shapes that are slow to plan (measuring text,
+# working out an oval's points) and usually drawn the same way frame after
+# frame (like the text and dials of a score board), by the call: the shape,
+# the language, the keyword arguments' names, values, and their types, and
+# the arguments and their types. False for calls that need a real shape.
+# Only calls whose values are all _PLAIN_STYLE_TYPES are remembered, and
+# none with an argument equal to 0, since 0.0 and -0.0 can make plans with
+# different points.
+_lazyCallPlans = {}
+# Set below, once the shapes are defined
+_CALL_PLAN_SHAPES = frozenset()
+
+
 def _lazyShapePlan(shape, args, kwargs):
+    values = tuple(kwargs.values())
+    types = tuple(map(type, values))
+    plainValues = _PLAIN_STYLE_TYPES.issuperset(types)
+    if plainValues and shape in _CALL_PLAN_SHAPES:
+        argTypes = tuple(map(type, args))
+        if _PLAIN_STYLE_TYPES.issuperset(argTypes) and 0 not in args:
+            callKey = (
+                shape,
+                shape_logic.cmuGraphicsLanguage,
+                tuple(kwargs),
+                values,
+                types,
+                args,
+                argTypes,
+            )
+            plan = _lazyCallPlans.get(callKey)
+            if plan is None:
+                style, geometry = _lazyCallStyle(shape, kwargs, values, types)
+                plan = style and shape_logic.lazyShapePlan(
+                    shape.__name__, args, style, geometry
+                )
+                if len(_lazyCallPlans) >= 1024:
+                    _lazyCallPlans.clear()
+                _lazyCallPlans[callKey] = plan or False
+            return plan or None
+    if plainValues and _LAZY_GEOMETRY_KWARGS.isdisjoint(kwargs):
+        # (Geometry keyword arguments with translated names get here too, and
+        # aren't remembered below)
+        callKey = (shape, shape_logic.cmuGraphicsLanguage, tuple(kwargs), values, types)
+        style = _lazyCallStyles.get(callKey)
+        if style is None:
+            style, geometry = _lazyCallStyle(shape, kwargs, values, types)
+            if geometry is _NO_GEOMETRY:
+                if len(_lazyCallStyles) >= 4096:
+                    _lazyCallStyles.clear()
+                _lazyCallStyles[callKey] = style
+        else:
+            geometry = _NO_GEOMETRY
+    else:
+        style, geometry = _lazyCallStyle(shape, kwargs, values, types)
+    if style is False:
+        return None
+    if geometry is _NO_GEOMETRY:
+        return _lazyPlanners[shape](args, style)
+    return shape_logic.lazyShapePlan(shape.__name__, args, style, geometry)
+
+
+def _lazyCallStyle(shape, kwargs, values, types):
+    """(the style, the geometry keyword arguments) for a call with these
+    keyword arguments (whose values and their types are values and types).
+    The style is False if the call needs a real shape. The geometry is
+    _NO_GEOMETRY if there are no geometry keyword arguments, and only if
+    the arguments' names are valid."""
     namesKey = (shape, shape_logic.cmuGraphicsLanguage, tuple(kwargs))
     names = _lazyKwargNames.get(namesKey)
     if names is None:
-        englishNames = _englishKwargNames(shape, namesKey[2])
-        if englishNames is None:
-            names = False
-        else:
-            names = (
-                englishNames,
-                tuple(
-                    i
-                    for i, name in enumerate(englishNames)
-                    if name in _LAZY_GEOMETRY_KWARGS
-                ),
-            )
-        if len(_lazyKwargNames) >= 4096:
-            _lazyKwargNames.clear()
-        _lazyKwargNames[namesKey] = names
+        names = _lazyKwargNamesFor(namesKey)
     if names is False:
-        return None
+        return False, None
     englishNames, geometryIndexes = names
 
-    values = tuple(kwargs.values())
     geometry = _NO_GEOMETRY
     if geometryIndexes:
         geometry = {}
         for i in geometryIndexes:
             geometry[englishNames[i]] = values[i]
         values = tuple(v for i, v in enumerate(values) if i not in geometryIndexes)
-    valuesKey = _lazyStyleKey(values)
-    if valuesKey is None:
-        style = None
+        types = tuple(map(type, values))
+    if _PLAIN_STYLE_TYPES.issuperset(types):
+        styleKey = (namesKey, values, types)
     else:
-        styleKey = (namesKey, valuesKey)
-        style = _lazyShapeStyles.get(styleKey)
+        valuesKey = _lazyStyleKey(values)
+        styleKey = None if valuesKey is None else (namesKey, valuesKey)
+    style = None if styleKey is None else _lazyShapeStyles.get(styleKey)
     if style is None:
         styleNames = [
             name for i, name in enumerate(englishNames) if i not in geometryIndexes
         ]
         style = shape_logic.lazyShapeStyle(dict(zip(styleNames, values))) or False
-        if valuesKey is not None:
+        if styleKey is not None:
             if len(_lazyShapeStyles) >= 4096:
                 _lazyShapeStyles.clear()
             _lazyShapeStyles[styleKey] = style
-    if style is False:
-        return None
-    return shape_logic.lazyShapePlan(shape.__name__, args, style, geometry)
+    return style, geometry
 
 
 def _makeDrawnShape(shape, args, kwargs, language):
@@ -696,9 +785,11 @@ def _makeDrawnShape(shape, args, kwargs, language):
 
 def makeDrawFn(shape):
     canBeLazy = shape.__name__ in _LAZY_SHAPE_NAMES
+    if canBeLazy:
+        _lazyPlanners[shape] = shape_logic.lazyPlanner(shape.__name__)
 
     def drawFn(*args, **kwargs):
-        appImpl = app._app
+        appImpl = _APP_IMPL
         if not appImpl._isMvc:
             raise Exception(
                 f'You called draw{shape.__name__} (a CPCS Mode function) outside of redrawAll.'
@@ -710,9 +801,8 @@ def makeDrawFn(shape):
             if plan:
                 global SHAPES_CREATED
                 SHAPES_CREATED += 1
-                language = shape_logic.cmuGraphicsLanguage
-                shape_logic.addLazyShape(
-                    plan, lambda: _makeDrawnShape(shape, args, kwargs, language)
+                shape_logic.addPendingShape(
+                    plan, (shape, args, kwargs, shape_logic.cmuGraphicsLanguage)
                 )
                 return
         # The same as `with NoMvc():`, which costs more than this, and this
@@ -753,6 +843,10 @@ def createDrawingFunctions():
 
 
 createDrawingFunctions()
+shape_logic.makeDrawnShape = _makeDrawnShape
+_CALL_PLAN_SHAPES = frozenset((Label, Circle, Oval))
+# The App (app._app), for the drawing functions (see AppWrapper.__init__)
+_APP_IMPL = None
 
 
 class KeyName(str):
@@ -1129,6 +1223,7 @@ class App(object):
         self._stepsPerSecond = 30
 
         self._tlg = Group()
+        shape_logic.makeTopLevelGroup(self._tlg._shape)
         sli.setTopLevelGroup(self._tlg)
 
         self.paused = False
@@ -1575,8 +1670,10 @@ class AppWrapper(object):
     stateHashAttrs = readWriteAttrs - {'group', 'disableMvcChecker'}
 
     def __init__(self, app):
+        global _APP_IMPL
         self._app = app
         app._wrapper = self
+        _APP_IMPL = app
 
     def __dir__(self):
         fields = set(AppWrapper.allAttrs)
