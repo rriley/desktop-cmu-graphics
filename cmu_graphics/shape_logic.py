@@ -604,7 +604,11 @@ def wyvernImageFromPilImage(image):
 class PILWrapper(object):
     def __init__(self, image):
         self.image = image
-        self._imageParams = None
+        # Converted now rather than when first drawn, which would change the
+        # wrapper (and maybe the PIL image, which loads its pixels then) while
+        # redrawAll runs. Apps keep these in app, so the MVC checker reported
+        # that as redrawAll changing the model.
+        self._imageParams = wyvernImageFromPilImage(image)
         self.uuid = str(uuid.uuid4())
 
     def get_params(self):
