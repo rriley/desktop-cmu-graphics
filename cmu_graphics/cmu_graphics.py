@@ -720,6 +720,23 @@ class App(object):
             self.redrawAllWrapper()
 
     def redrawAllWrapper(self):
+        # Before the event loop runs (like runApp's first redrawAll), run it
+        # right away, so errors are handled the same way as without frame
+        # skipping (an error before the window opens ends the program).
+        if self._skipFrames and self._isMvc and self._running:
+            # Run it when the next frame is drawn (see drawFrame)
+            self._redrawAllPending = True
+            return
+        self.runRedrawAll()
+
+    @_safeMethod
+    def runPendingRedrawAll(self):
+        # Errors from a deferred redrawAll (like an MVC violation) are handled
+        # like errors from the event handler that would have run it
+        self._redrawAllPending = False
+        self.runRedrawAll()
+
+    def runRedrawAll(self):
         self.group.clear()
         shape_logic.startShapeTemplateFrame()
 
@@ -757,6 +774,21 @@ class App(object):
             self.inRedrawAll = False
 
     def drawErrorScreen(self):
+        self._frameChanged = True
+        if self._redrawAllPending:
+            # With frame skipping, show what the event handlers before the
+            # error drew (normally their redrawAll calls would have already
+            # run), then the error screen over it. Clearing the flag first
+            # means an error in that redrawAll can't come back here.
+            self._redrawAllPending = False
+            errorScreensBefore = self._errorScreensDrawn
+            try:
+                self.runRedrawAll()
+            except Exception:
+                pass  # The app has already stopped with an error
+            if self._errorScreensDrawn != errorScreensBefore:
+                return  # That redrawAll failed, and drew the error screen
+        self._errorScreensDrawn += 1
         with NoMvc():
             Rect(0, 0, self.width, self.height, fill=None, border='red', borderWidth=2)
             Rect(
@@ -845,6 +877,21 @@ class App(object):
 
         self.frameworkRedrew = True
 
+    def drawFrame(self, ctx):
+        """Draws the app to ctx for a 'redraw' event."""
+        if self._skipFrames and self._isMvc:
+            if self._redrawAllPending:
+                self.runPendingRedrawAll()
+                self._frameChanged = True
+            showInspector = self.shouldDrawInspector()
+            if not (self._frameChanged or showInspector or self._inspectorWasDrawn):
+                # Nothing changed since the last frame, which ctx still holds
+                return
+            self._frameChanged = False
+            self._inspectorWasDrawn = showInspector
+        self.inspector.clearCache()
+        self.redrawAll(ctx)
+
     def shouldDrawInspector(self):
         return self.inspectorEnabled and (
             self.paused or self.alwaysShowInspector or self.isCtrlKeyDown
@@ -896,6 +943,22 @@ class App(object):
         self._cursorVisible = True
         self._fullscreen = False
 
+        # Frame skipping, an opt-in mode for slow devices, set with the
+        # CMU_GRAPHICS_SKIP_FRAMES=1 environment variable. It only affects
+        # CPCS Mode (runApp). Normally redrawAll runs after every event
+        # handler, even when several handlers run before the next frame is
+        # drawn (like onStep and onKeyHold), and every frame is drawn even
+        # if nothing changed. With frame skipping, redrawAll runs once, right
+        # before the next frame is drawn, and frames where nothing could
+        # have changed aren't drawn at all (the window keeps the last one).
+        # So redrawAll runs fewer times, which students can see if it
+        # prints or counts something.
+        self._skipFrames = os.environ.get('CMU_GRAPHICS_SKIP_FRAMES') == '1'
+        self._redrawAllPending = False
+        self._frameChanged = True
+        self._inspectorWasDrawn = False
+        self._errorScreensDrawn = 0
+
     def get_group(self):
         return self._tlg
 
@@ -936,6 +999,7 @@ class App(object):
         return sli.slGetAppProperty('background')
 
     def setBackground(self, value):
+        self._frameChanged = True
         return sli.slSetAppProperty('background', value)
 
     background = property(getBackground, setBackground)
@@ -1125,6 +1189,11 @@ class App(object):
     def handleEvent(self, event, surface):
         self._ctx = surface.canvas
 
+        if event.event_type == 'resize':
+            # The canvas was replaced with a blank one, even if the app's size
+            # didn't change, so the next frame must be drawn
+            self._frameChanged = True
+
         # The inspector keeps working after the app stops (e.g. on an error),
         # so track the mouse and control key even then
         if event.event_type in ('mouse_move', 'mouse_drag'):
@@ -1145,14 +1214,12 @@ class App(object):
                     self.callUserFn('onMousePress', (200, 200, 0))
                     self._screenshotTriggered = True
                 else:
-                    self.inspector.clearCache()
-                    self.redrawAll(self._ctx)
+                    self.drawFrame(self._ctx)
                     self.getScreenshot(self._takeScreenshotPath)
                     self._running = False
                     self.quit()
                 return
-            self.inspector.clearCache()
-            self.redrawAll(self._ctx)
+            self.drawFrame(self._ctx)
 
         elif event.event_type == 'mouse_press':
             self.callUserFn(
