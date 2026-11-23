@@ -3289,6 +3289,53 @@ class PolygonWithTransform(Polygon):
         self.multMat(trans)
 
 
+def _copyAttrDefaults(attrDefaults):
+    # copy.deepcopy(attrDefaults), which is slow, and runs for every Image made.
+    # The defaults are immutable values and lists of them, so copying the lists
+    # makes the same copy.
+    copied = {}
+    for name, value in attrDefaults.items():
+        valueType = type(value)
+        if valueType is list and all(
+            type(item) in _TEMPLATE_IMMUTABLE_TYPES for item in value
+        ):
+            copied[name] = value[:]
+        elif valueType in _TEMPLATE_IMMUTABLE_TYPES:
+            copied[name] = value
+        else:
+            return copy.deepcopy(attrDefaults)
+    return copied
+
+
+# Images resampled to the sizes they're drawn at. Each Image keeps its own
+# resampled copy, but in CPCS Mode a new Image is made every frame, so share
+# them between Images too: the same image at the same size resamples the
+# same. Keyed by the source image's id; entries hold the source image itself,
+# so its id can't be reused while the entry exists. Least recently used
+# entries are dropped past a budget of pixels.
+MAX_SCALED_IMAGE_PIXELS = 8_000_000
+_scaledImages = {}
+_scaledImagePixels = 0
+
+
+def scaledImage(src, width, height):
+    global _scaledImagePixels
+    key = (id(src), width, height)
+    entry = _scaledImages.pop(key, None)
+    if entry is not None and entry[0] is not src:
+        _scaledImagePixels -= entry[2]
+        entry = None
+    if entry is None:
+        entry = (src, src.scaled(width, height), width * height)
+        _scaledImagePixels += entry[2]
+        while _scaledImages and _scaledImagePixels > MAX_SCALED_IMAGE_PIXELS:
+            oldest = next(iter(_scaledImages))
+            _scaledImagePixels -= _scaledImages.pop(oldest)[2]
+    # Reinsert, so the dict's order is least to most recently used
+    _scaledImages[key] = entry
+    return entry[1]
+
+
 class CMUImage(PolygonWithTransform):
     def __init__(self, attrs):
         if attrs is not None:
@@ -3313,7 +3360,7 @@ class CMUImage(PolygonWithTransform):
                 [0, 1],
             ]
             super().__init__(attrs)
-            self.attrDefaults = copy.deepcopy(self.attrDefaults)
+            self.attrDefaults = _copyAttrDefaults(self.attrDefaults)
             self.attrDefaults.update({'fill': None})
 
     def get_url(self):
@@ -3343,7 +3390,7 @@ class CMUImage(PolygonWithTransform):
             else:
                 cache = getattr(self, '_scaledImage', None)
                 if cache is None or cache[0] != (tw, th):
-                    cache = ((tw, th), src.scaled(tw, th))
+                    cache = ((tw, th), scaledImage(src, tw, th))
                     self._scaledImage = cache
                 image = cache[1]
             ctx.translate(x, y)
