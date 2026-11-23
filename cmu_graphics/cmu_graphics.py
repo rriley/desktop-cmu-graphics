@@ -932,7 +932,12 @@ class App(object):
         self._isMvc = False
         self._initialScreen = None
 
-        self._disableMvcChecker = False
+        # CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 starts apps with the MVC violation
+        # checker off, as if they set app.disableMvcChecker = True, for running
+        # unmodified apps on slow devices. An app can still turn it back on.
+        self._disableMvcChecker = (
+            os.environ.get('CMU_GRAPHICS_DISABLE_MVC_CHECKER') == '1'
+        )
         self.slowMvcCheckerCount = 0
 
         self._lastStepTime = None
