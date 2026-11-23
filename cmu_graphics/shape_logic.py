@@ -1613,6 +1613,11 @@ class Shape(object):
         if self.isGroup:
             for s in self._shapes:
                 s.draw(ctx)
+            # Groups used to leave this save on the canvas's stack, which
+            # grew by one entry per group drawn every frame. Children
+            # restore everything they change, so restoring here draws the
+            # same thing.
+            ctx.restore()
         else:
             bw = self.borderWidth if self.border else 0
             if isinstance(self, Label):
