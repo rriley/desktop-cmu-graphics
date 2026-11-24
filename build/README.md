@@ -22,6 +22,17 @@ Only the zip installer loads the vendored binaries: `build.py` sets
   environments are the ones that test the vendored binaries.
 
 
+## Local Linux ARM64 wheels
+
+Run `./build/helpers/build_linux_arm64.sh` to cross-compile both
+  `cmu_graphics_helpers` and `cmu_graphics_joystick` on an x86_64 host using
+  Docker. The wheels are written to `wheels-arm64/`. Use `-d <debian-release>`
+  to match the destination device (default: `trixie`) and `-o <directory>` to
+  change the output directory. These are Debian-targeted `linux_aarch64`
+  wheels, not manylinux wheels. The target device needs `libudev1` for joystick
+  support; see the script's header for the full installation commands.
+
+
 ## Linux image baselines
 
 Text renders with different fonts on Linux, so text tests can have a

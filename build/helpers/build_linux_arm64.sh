@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Cross-compile the cmu_graphics_helpers wheel for Linux arm64 (aarch64).
+# Cross-compile cmu_graphics_helpers and cmu_graphics_joystick for Linux arm64 (aarch64).
 #
-# For local builds and testing. The published aarch64 wheel is a manylinux
+# For local builds and testing. The published helpers aarch64 wheel is a manylinux
 # wheel that CI builds natively on an ARM runner (see
 # .github/actions/linux-helpers-wheel); this script is for building one on an
 # x86_64 machine without waiting for CI.
@@ -9,7 +9,7 @@
 # The build runs on an x86_64 host inside a Debian container using Debian's
 # arm64 multiarch packages and cross compilers -- no ARM machine or qemu
 # needed. The wheel links against the container's glibc, FreeType,
-# fontconfig, and ALSA, so build with the same Debian release as the device
+# fontconfig, ALSA, and libudev, so build with the same Debian release as the device
 # you'll install on (default: trixie / Debian 13, e.g. dArkOS on the R36S).
 #
 # Usage:
@@ -37,9 +37,9 @@
 # cmu-helpers-arm64-target-DEBIAN_RELEASE.
 #
 # On the device (Debian 13):
-#   sudo apt install python3-venv libfreetype6 libfontconfig1 libasound2t64
+#   sudo apt install python3-venv libfreetype6 libfontconfig1 libasound2t64 libudev1
 #   python3 -m venv ~/cmu-venv
-#   ~/cmu-venv/bin/pip install cmu_graphics_helpers-*-linux_aarch64.whl
+#   ~/cmu-venv/bin/pip install cmu_graphics_helpers-*-linux_aarch64.whl cmu_graphics_joystick-*-linux_aarch64.whl
 #   ~/cmu-venv/bin/pip install cmu-graphics
 #
 # Note: winit needs X11 or Wayland at runtime. On handhelds that run games on
@@ -84,7 +84,7 @@ RUN dpkg --add-architecture arm64 \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl build-essential pkg-config python3-venv clang file \
       gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-      libfreetype-dev:arm64 libfontconfig-dev:arm64 libasound2-dev:arm64 \
+      libfreetype-dev:arm64 libfontconfig-dev:arm64 libasound2-dev:arm64 libudev-dev:arm64 \
  && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir 'maturin>=1.12,<2'
 DOCKERFILE
@@ -110,7 +110,7 @@ if [ "$clean_build" = 1 ]; then
   docker volume rm "$target_volume" > /dev/null 2>&1 || true
 fi
 
-echo "Building cmu_graphics_helpers for aarch64 in debian:$debian_release"
+echo "Building helpers and joystick for aarch64 in debian:$debian_release"
 echo "Output: $out_dir"
 
 docker run --rm -i \
@@ -142,30 +142,38 @@ export PKG_CONFIG_ALLOW_CROSS=1 \
   CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
   CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
-echo "==> Building the wheel"
-cp -r /src/cmu_graphics_helpers /build
-rm -rf /build/target
-cd /build
-mkdir -p /tmp/wheel
-# /target is a volume, so dependencies built (and downloaded) by earlier runs
-# are reused
-/venv/bin/maturin build --release --target aarch64-unknown-linux-gnu \
-  --compatibility linux --target-dir /target --out /tmp/wheel
+for package in cmu_graphics_helpers cmu_graphics_joystick; do
+  echo "==> Building $package"
+  mkdir -p "/build/$package"
+  cp "/src/$package/Cargo.toml" "/src/$package/Cargo.lock" "/src/$package/pyproject.toml" "/build/$package/"
+  cp -r "/src/$package/src" "/build/$package/"
+  if [ "$package" = cmu_graphics_helpers ]; then
+    cp /src/cmu_graphics_helpers/*.png "/build/$package/"
+  fi
+  cd "/build/$package"
+  # /target is a volume, so dependencies built by earlier runs are reused.
+  /venv/bin/maturin build --release --locked --target aarch64-unknown-linux-gnu \
+    --compatibility linux --target-dir /target --out "/tmp/wheels/$package"
 
-echo "==> Checking the result"
-wheel="$(ls /tmp/wheel/*.whl)"
-mkdir -p /tmp/x && cd /tmp/x && python3 -m zipfile -e "$wheel" .
-so="$(find . -name '*.so')"
-file "$so"
-echo "Shared libraries needed:"
-aarch64-linux-gnu-readelf -d "$so" | grep NEEDED | sed 's/.*\[/  /; s/\]//'
-echo "Newest glibc symbol required: $(aarch64-linux-gnu-objdump -T "$so" \
-  | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
-echo "glibc in this container:      GLIBC_$(ldd --version | head -1 | grep -o '[0-9.]*$')"
+  echo "==> Checking $package"
+  for wheel in "/tmp/wheels/$package/"*.whl; do
+    extract_dir="/tmp/extracted/$package"
+    mkdir -p "$extract_dir"
+    python3 -m zipfile -e "$wheel" "$extract_dir"
+    so="$(find "$extract_dir" -name '*.so')"
+    file "$so"
+    # Verify the extension is ARM64; it cannot be imported on the x86_64 host.
+    aarch64-linux-gnu-readelf -h "$so" | grep -q 'Machine:.*AArch64'
+    echo "Shared libraries needed:"
+    aarch64-linux-gnu-readelf -d "$so" | grep NEEDED | sed 's/.*\[/  /; s/\]//'
+    echo "Newest glibc symbol required: $(aarch64-linux-gnu-objdump -T "$so" \
+      | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
 
-cp "$wheel" /out/
-chown "$HOST_UID:$HOST_GID" "/out/$(basename "$wheel")"
-echo "==> Wrote /out/$(basename "$wheel")"
+    cp "$wheel" /out/
+    chown "$HOST_UID:$HOST_GID" "/out/$(basename "$wheel")"
+    echo "==> Wrote /out/$(basename "$wheel")"
+  done
+done
 CONTAINER
 
-echo "Done: $(ls -t "$out_dir"/*linux_aarch64.whl | head -1)"
+echo "Done: ARM64 wheels written to $out_dir"
