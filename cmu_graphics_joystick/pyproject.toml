@@ -1,0 +1,11 @@
+[build-system]
+requires = ["maturin>=1.12,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cmu-graphics-joystick"
+requires-python = ">=3.8"
+dynamic = ["version"]
+
+[tool.maturin]
+profile = "release"
