@@ -22,6 +22,16 @@ Only the zip installer loads the vendored binaries: `build.py` sets
   environments are the ones that test the vendored binaries.
 
 
+## Local Linux wheels
+
+Run `./build/helpers/build_linux_wheels.sh` on an x86_64 host with Docker to
+  build `manylinux_2_34` wheels for both x86_64 and aarch64 (cross-compiled
+  against an aarch64 AlmaLinux 9 sysroot, without qemu). The wheels are written
+  to `wheels-local/`. Use `-a x86_64` or `-a aarch64` to build just one, and
+  `-o <directory>` to change the output directory. See the script's header for
+  its other options and the installation commands for a device.
+
+
 ## Linux image baselines
 
 Text renders with different fonts on Linux, so text tests can have a

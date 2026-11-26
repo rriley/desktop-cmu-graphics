@@ -11,6 +11,7 @@ cmu_graphics_installer.zip
 cmu_graphics_notarize.zip
 cmu_graphics_installer/
 foo.py
+/wheels-local/
 
 ##########################
 
