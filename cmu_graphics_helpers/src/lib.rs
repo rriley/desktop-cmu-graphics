@@ -1,4 +1,6 @@
 /* PYGEO */
+mod joystick;
+
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -2203,5 +2205,13 @@ fn cmu_graphics_helpers(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .import("sys")?
         .getattr("modules")?
         .set_item("cmu_graphics_helpers.wyvern", wyvern)?;
+
+    let joystick = PyModule::new(m.py(), "joystick")?;
+    joystick.add_class::<joystick::Joysticks>()?;
+    m.add_submodule(&joystick)?;
+    m.py()
+        .import("sys")?
+        .getattr("modules")?
+        .set_item("cmu_graphics_helpers.joystick", joystick)?;
     Ok(())
 }
